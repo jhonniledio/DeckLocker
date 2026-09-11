@@ -1,99 +1,83 @@
-# Decky Plugin Template [![Chat](https://img.shields.io/badge/chat-on%20discord-7289da.svg)](https://deckbrew.xyz/discord)
+# Deck Locker
 
-Reference example for using [decky-frontend-lib](https://github.com/SteamDeckHomebrew/decky-frontend-lib) (@decky/ui) in a [decky-loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin.
+Lock selected games behind a PIN on your Steam Deck. Games can't be launched — from the library, context menus, or any other entry point — without entering the correct PIN first.
 
-### **Please also refer to the [wiki](https://wiki.deckbrew.xyz/en/user-guide/home#plugin-development) for important information on plugin development and submissions/updates. currently documentation is split between this README and the wiki which is something we are hoping to rectify in the future.**  
+## Features
 
-## Developers
+- **PIN-lock any game** — Steam games and non-Steam shortcuts both supported
+- **Full-screen lock screen** — covers the game page entirely with a numeric keypad and game art
+- **Context menu protection** — blocks the "Play" shortcut from the Options context menu
+- **Safety-net hook** — catches any game that manages to start anyway and kills it before it runs
+- **Re-lock button** — a lock icon appears in the play-controls row after unlocking, letting you re-lock without leaving the page
+- **QAM panel lock** — optionally require a PIN to open Deck Locker's own settings panel
+- **Unlock persists per session** — you only need to enter the PIN once per game per session
+- **Customizable lock screen** — glass keypad effect, circle keys, adjustable corner radius, keypad side swap, hero art background with blur/opacity controls, re-lock animation toggle
 
-### Dependencies
+## Installation
 
-This template relies on the user having Node.js v16.14+ and `pnpm` (v9) installed on their system.  
-Please make sure to install pnpm v9 to prevent issues with CI during plugin submission.  
-`pnpm` can be downloaded from `npm` itself which is recommended.
+Install via the Decky Plugin Store, or manually:
 
-#### Linux
+1. Download the latest release zip
+2. In Decky Loader, go to **Settings → Install Plugin from ZIP** and select the file
+
+## Usage
+
+### Setting a PIN
+
+1. Press the **Quick Access** button (⋯) to open the QAM panel
+2. Open the **Deck Locker** tab
+3. Toggle **Enable Lock** on
+4. Tap **Set PIN** and enter a PIN of at least 4 digits
+
+### Locking a game
+
+1. Make sure **Enable Lock** is on and a PIN is set
+2. Expand **Show Games List**
+3. Toggle on any game you want to lock
+
+### Unlocking a game
+
+Navigate to the game's library page. The lock screen appears automatically — enter your PIN to unlock. The game stays unlocked for the rest of the session.
+
+### Re-locking a game
+
+After unlocking, a small lock icon appears next to the Play button on the game's page. Tap it to re-lock the game immediately.
+
+### Locking the settings panel
+
+Under **OTHERS**, toggle **Enable Lock This Plugin** to require the PIN before anyone can open Deck Locker's settings.
+
+## Customization
+
+Tap **Customization** in the Deck Locker panel to adjust:
+
+| Setting | Description |
+|---|---|
+| Circle Keys | Makes keypad buttons fully circular |
+| Keypad Corner Roundness | Slider for rectangular button corner radius |
+| Glass Effect | Semi-transparent blurred keypad background |
+| Keypad on Right | Swaps the keypad and game art sides |
+| Lock Screen Game Background | Shows the game's hero art behind the lock screen |
+| Background Blur / Opacity | Controls the hero art blur and dimming |
+| Re-lock Animation | Animated lock icon when manually re-locking |
+
+## Notes
+
+- Locking a game prevents launch from the library page, context menus, and external shortcuts. It is not a security guarantee against a determined user with direct filesystem access.
+- The PIN is stored as a SHA-256 hash in `<DECKY_PLUGIN_SETTINGS_DIR>/settings.json`.
+- Unlock state resets each time Steam restarts.
+
+## Building from source
+
+Requires Node.js v16.14+ and pnpm v9.
 
 ```bash
-sudo npm i -g pnpm@9
+pnpm install
+pnpm run build
 ```
 
-If you would like to build plugins that have their own custom backends, Docker is required as it is used by the Decky CLI tool.
+The built plugin is placed in `out/`.
 
-### Making your own plugin
+## License
 
-1. You can fork this repo or utilize the "Use this template" button on Github.
-2. In your local fork/own plugin-repository run these commands:
-   1. ``pnpm i``
-   2. ``pnpm run build``
-   - These setup pnpm and build the frontend code for testing.
-3. Consult the [decky-frontend-lib](https://github.com/SteamDeckHomebrew/decky-frontend-lib) repository for ways to accomplish your tasks.
-   - Documentation and examples are still rough, 
-   - Decky loader primarily targets Steam Deck hardware so keep this in mind when developing your plugin.
-4. If using VSCodium/VSCode, run the `setup` and `build` and `deploy` tasks. If not using VSCodium etc. you can derive your own makefile or just manually utilize the scripts for these commands as you see fit.
-
-If you use VSCode or it's derivatives (we suggest [VSCodium](https://vscodium.com/)!) just run the `setup` and `build` tasks. It's really that simple.
-
-#### Other important information
-
-Everytime you change the frontend code (`index.tsx` etc) you will need to rebuild using the commands from step 2 above or the build task if you're using vscode or a derivative.
-
-Note: If you are receiving build errors due to an out of date library, you should run this command inside of your repository:
-
-```bash
-pnpm update @decky/ui --latest
-```
-
-### Backend support
-
-If you are developing with a backend for a plugin and would like to submit it to the [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database) you will need to have all backend code located in ``backend/src``, with backend being located in the root of your git repository.
-When building your plugin, the source code will be built and any finished binary or binaries will be output to ``backend/out`` (which is created during CI.)
-If your buildscript, makefile or any other build method does not place the binary files in the ``backend/out`` directory they will not be properly picked up during CI and your plugin will not have the required binaries included for distribution.
-
-Example:  
-In our makefile used to demonstrate the CI process of building and distributing a plugin backend, note that the makefile explicitly creates the `out` folder (``backend/out``) and then compiles the binary into that folder. Here's the relevant snippet.
-
-```make
-hello:
-	mkdir -p ./out
-	gcc -o ./out/hello ./src/main.c
-```
-
-The CI does create the `out` folder itself but we recommend creating it yourself if possible during your build process to ensure the build process goes smoothly.
-
-Note: When locally building your plugin it will be placed into a folder called 'out' this is different from the concept described above.
-
-The out folder is not sent to the final plugin, but is then put into a ``bin`` folder which is found at the root of the plugin's directory.  
-More information on the bin folder can be found below in the distribution section below.
-
-### Distribution
-
-We recommend following the instructions found in the [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database) on how to get your plugin up on the plugin store. This is the best way to get your plugin in front of users.
-You can also choose to do distribution via a zip file containing the needed files, if that zip file is uploaded to a URL it can then be downloaded and installed via decky-loader.
-
-Layout of a plugin zip ready for distribution:
-```
-pluginname-v1.0.0.zip (version number is optional but recommended for users sake)
-   |
-   pluginname/ <directory>
-   |  |  |
-   |  |  bin/ <directory> (optional)
-   |  |     |
-   |  |     binary (optional)
-   |  |
-   |  dist/ <directory> [required]
-   |      |
-   |      index.js [required]
-   | 
-   package.json [required]
-   plugin.json [required]
-   main.py {required if you are using the python backend of decky-loader: serverAPI}
-   README.md (optional but recommended)
-   LICENSE(.md) [required, filename should be roughly similar, suffix not needed]
-```
-
-Note regarding licenses: Including a license is required for the plugin store if your chosen license requires the license to be included alongside usage of source-code/binaries!
-
-Standard procedure for licenses is to have your chosen license at the top of the file, and to leave the original license for the plugin-template at the bottom. If this is not the case on submission to the plugin database, you will be asked to fix this discrepancy.
-
-We cannot and will not distribute your plugin on the Plugin Store if it's license requires it's inclusion but you have not included a license to be re-distributed with your plugin in the root of your git repository.
+BSD 3-Clause — see [LICENSE](LICENSE).
