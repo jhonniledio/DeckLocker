@@ -6,6 +6,6 @@
   "publish": {
     "tags": ["utility", "root"],
     "description": "Lock selected games behind a PIN so they can't be launched without entering it.",
-    "image": "https://raw.githubusercontent.com/Borgs/DeckLocker/main/assets/banner.svg"
+    "image": "https://raw.githubusercontent.com/jhonniledio/DeckLocker/main/assets/banner.svg"
   }
 }
