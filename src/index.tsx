@@ -743,24 +743,37 @@ function GlobalDeckyQamGate() {
     // Show gate when QAM opens (if decky_panel_lock_enabled + pin_set + still locked).
     // Re-lock and hide gate when QAM closes.
     let qamHook: any;
-    try {
-      qamHook = (window as any).SteamClient.UI.RegisterForQuickAccessMenuVisible(async (open: boolean) => {
-        if (open) {
-          const s = cachedSettings ?? (await getSettingsCached());
+    const handleQamVisible = (open: boolean) => {
+      if (open) {
+        getSettingsCached().then((s) => {
           if (s.decky_panel_lock_enabled && s.pin_set && deckyQamLocked) {
             setGateActive(true);
           }
-        } else {
-          setGateActive(false);
-          setTimeout(() => {
-            if (cachedSettings?.decky_panel_lock_enabled) {
-              deckyQamLocked = true;
-            }
-          }, 400);
+        }).catch(() => {});
+      } else {
+        setGateActive(false);
+        setTimeout(() => {
+          if (cachedSettings?.decky_panel_lock_enabled) {
+            deckyQamLocked = true;
+          }
+        }, 400);
+      }
+    };
+    const qamApis = ["RegisterForQuickAccessMenuVisible", "RegisterForQuickAccessMenuVisibilityChange"];
+    for (const apiName of qamApis) {
+      try {
+        const fn = (window as any).SteamClient?.UI?.[apiName];
+        if (typeof fn === "function") {
+          qamHook = fn.call((window as any).SteamClient.UI, handleQamVisible);
+          console.log("DeckLocker: registered QAM hook via SteamClient.UI." + apiName);
+          break;
         }
-      });
-    } catch (e) {
-      console.error("DeckLocker: could not register QAM visibility hook", e);
+      } catch (e) {
+        console.warn("DeckLocker: SteamClient.UI." + apiName + " failed:", e);
+      }
+    }
+    if (!qamHook) {
+      console.error("DeckLocker: no QAM visibility hook could be registered");
     }
 
     // Hide gate when unlock succeeds (notifyDeckyQamLockChange fires the listener).
@@ -1916,7 +1929,7 @@ function Content() {
 
               <PanelSectionRow>
                 <ToggleField
-                  label="Lock Decky Panel"
+                  label="Enable Lock Decky Panel"
                   description="Require a PIN before the Decky plugin list is shown (disables Lock This Plugin)"
                   checked={settings.decky_panel_lock_enabled}
                   onChange={onDeckyPanelLockToggle}
@@ -1983,16 +1996,28 @@ export default definePlugin(() => {
   // Clears all per-session game unlocks when the Steam Deck goes to sleep,
   // if the user has relock_on_sleep enabled.
   let suspendHook: any;
-  try {
-    suspendHook = (window as any).SteamClient.System.RegisterForOnSuspendRequest(() => {
-      const s = cachedSettings;
-      if (s?.relock_on_sleep) {
-        unlockedThisSession.clear();
-        settledThisSession.clear();
+  const relockOnSuspend = () => {
+    const s = cachedSettings;
+    if (s?.relock_on_sleep) {
+      unlockedThisSession.clear();
+      settledThisSession.clear();
+    }
+  };
+  const suspendApis = ["RegisterForOnSuspendRequest", "RegisterForOnResumeFromSuspend"];
+  for (const apiName of suspendApis) {
+    try {
+      const fn = (window as any).SteamClient?.System?.[apiName];
+      if (typeof fn === "function") {
+        suspendHook = fn.call((window as any).SteamClient.System, relockOnSuspend);
+        console.log("DeckLocker: registered suspend hook via SteamClient.System." + apiName);
+        break;
       }
-    });
-  } catch (e) {
-    console.error("DeckLocker: could not register suspend hook", e);
+    } catch (e) {
+      console.warn("DeckLocker: SteamClient.System." + apiName + " failed:", e);
+    }
+  }
+  if (!suspendHook) {
+    console.error("DeckLocker: could not register any suspend hook");
   }
 
   return {
