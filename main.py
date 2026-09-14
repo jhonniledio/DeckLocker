@@ -56,32 +56,36 @@ class Plugin:
             self.settings.setdefault("locked_badge_position", "top-left")
             self.settings.setdefault("lock_method", "pin")
         else:
-            self.settings = {
-                "global_lock_enabled": False,
-                "pin_hash": "",
-                "locked_apps": [],
-                "locked_plugins": [],
-                "locked_qam_tabs": [],
-                "locked_main_menu_items": [],
-                "qam_lock_enabled": False,
-                "keypad_corner_radius": 14,
-                "lockscreen_hero_bg_enabled": False,
-                "lockscreen_bg_blur_px": 8,
-                "lockscreen_bg_opacity_percent": 30,
-                "relock_animation_enabled": True,
-                "keypad_shape": "rounded",
-                "keypad_glass_effect": False,
-                "keypad_on_right": False,
-                "relock_on_sleep": False,
-                "relock_on_exit": False,
-                "decky_panel_lock_enabled": False,
-                "hide_game_art": False,
-                "keypad_key_size": 80,
-                "keypad_font_size": 22,
-                "locked_badge_enabled": True,
-                "locked_badge_position": "top-left",
-                "lock_method": "pin",
-            }
+            self.settings = self._default_settings()
+
+    @staticmethod
+    def _default_settings() -> dict:
+        return {
+            "global_lock_enabled": False,
+            "pin_hash": "",
+            "locked_apps": [],
+            "locked_plugins": [],
+            "locked_qam_tabs": [],
+            "locked_main_menu_items": [],
+            "qam_lock_enabled": False,
+            "keypad_corner_radius": 14,
+            "lockscreen_hero_bg_enabled": False,
+            "lockscreen_bg_blur_px": 8,
+            "lockscreen_bg_opacity_percent": 30,
+            "relock_animation_enabled": True,
+            "keypad_shape": "rounded",
+            "keypad_glass_effect": False,
+            "keypad_on_right": False,
+            "relock_on_sleep": False,
+            "relock_on_exit": False,
+            "decky_panel_lock_enabled": False,
+            "hide_game_art": False,
+            "keypad_key_size": 80,
+            "keypad_font_size": 22,
+            "locked_badge_enabled": True,
+            "locked_badge_position": "top-left",
+            "lock_method": "pin",
+        }
 
     async def _save_settings(self):
         os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)

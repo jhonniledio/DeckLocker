@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["utility", "root"],
-    "description": "Lock selected games behind a PIN so they can't be launched without entering it.",
+    "description": "Lock games, plugins, Quick Access Menu tabs, and Steam Menu items behind a PIN, with optional lock badges and deep lock-screen customization.",
     "image": "https://raw.githubusercontent.com/jhonniledio/DeckLocker/main/assets/banner.svg"
   }
 }

@@ -1,105 +1,42 @@
 # Deck Locker
 
-Lock games, plugins, Quick Access Menu tabs, and Steam Menu (Main Menu) items behind a PIN on your Steam Deck. Locked content can't be opened — from the library, context menus, Home shortcuts, or any other entry point — without entering the correct PIN first.
+Lock games, plugins, Quick Access Menu tabs, and Steam Menu items behind a PIN on your Steam Deck. Locked content stays inaccessible — from the library, context menus, Home shortcuts, or any other entry point — until the right PIN is entered.
+
+Built for the classic "someone borrows my Deck" problem: only the games you've approved are playable, everything else stays out of reach. 😜
 
 ## Features
 
-- **PIN-lock any game** — Steam games and non-Steam shortcuts both supported
-- **Full-screen lock screen** — covers the game page entirely with a numeric keypad and game art
-- **Lock Decky plugins** — require a PIN before any installed plugin's panel opens, including Deck Locker's own
-- **Lock Quick Access Menu tabs** — Notifications, Friends, Quick Settings, Performance, Help, Music, Remote Play Together, and Voice Chat can each be locked individually
-- **Lock Steam Menu items** — Library, Store, Media, Downloads, Settings, and Power (the menu opened with the physical **STEAM** button) can each be locked individually, including the Library's Home-screen shortcut tile
-- **Context menu protection** — blocks the "Play" shortcut from the Options context menu
-- **Safety-net hook** — catches any game that manages to start anyway and kills it before it runs
-- **Re-lock button** — a lock icon appears in the play-controls row after unlocking, letting you re-lock without leaving the page
-- **Locked badges** — an optional lock icon overlaid on locked games' cover art in Home, Recent, and the Library grid, in your choice of corner (or centered)
-- **Unlock persists per session** — you only need to enter the PIN once per item per session, until you re-lock it, close the menu it lives in, or (optionally) the Deck goes to sleep
-- **Customizable lock screen** — glass keypad effect, square/rounded/circle keys, adjustable corner radius, key and number size, keypad side swap, keypad-only mode, hero art background with blur/opacity controls, re-lock animation toggle
-- **Built for more than PIN** — the lock method is already a saved setting, ready for the additional methods below
+- Lock individual games, Decky plugins, QAM tabs, and Steam Menu items independently
+- Full-screen numeric keypad lock screen with game art, or a compact PIN prompt for menus and panels
+- Locked games show an optional lock badge on their cover art in Home, Recent, and the Library
+- Unlocks last for the session — no repeated PIN entry until you re-lock or close the menu
+- Deep customization: keypad shape/size, glass effect, background art, re-lock animation, and more
+- Built to support more than PIN — additional unlock methods are already on the settings menu, marked as they arrive
 
 ## Installation
 
-Install via the Decky Plugin Store, or manually:
+Not yet available on the Decky Plugin Store — install manually:
 
 1. Download the latest release zip
 2. In Decky Loader, go to **Settings → Install Plugin from ZIP** and select the file
 
 ## Usage
 
-### Setting a PIN
+1. Open the **Deck Locker** tab from the Quick Access Menu (⋯)
+2. Toggle **Enable Lock** and set a PIN
+3. Expand any of the **Games**, **Plugins**, **Quick Menu**, or **Steam Menu** sections and toggle on what you want locked
 
-1. Press the **Quick Access** button (⋯) to open the QAM panel
-2. Open the **Deck Locker** tab
-3. Toggle **Enable Lock** on
-4. Tap **Set PIN** and enter a PIN of at least 4 digits
+Whatever you lock will prompt for the PIN the next time it's opened. Games get a full lock screen; everything else gets a compact PIN prompt in place. A locked game also gets a small re-lock button next to its Play button once unlocked.
 
-### Locking a game
+### Forgot your PIN?
 
-1. Make sure **Enable Lock** is on and a PIN is set
-2. Under **GAMES**, expand **Show Games List**
-3. Toggle on any game you want to lock
-
-### Locking a plugin
-
-1. Under **PLUGINS**, expand **Show Plugin List**
-2. Toggle on Deck Locker itself, or any other installed plugin, to require a PIN before its panel opens
-
-To lock the Decky plugin browser tab entirely (the tab listing *all* installed plugins), expand **More Settings** near the top and enable **Lock Decky Panel** instead.
-
-### Locking Quick Access Menu tabs
-
-1. Under **QUICK MENU**, expand **Show Tabs List**
-2. Toggle on any built-in tab (Notifications, Friends, Quick Settings, Performance, Help, Music, Remote Play Together, Voice Chat) to require a PIN before it opens
-
-### Locking Steam Menu items
-
-1. Under **STEAM MENU**, expand **Show Items List**
-2. Toggle on any item (Library, Store, Media, Downloads, Settings, Power) to require a PIN before it opens — this also covers reaching Library through the "View more in your Library" tile on the Home screen, not just the Steam Menu itself
-
-### Unlocking
-
-Navigate to (or open) the locked game, plugin, tab, or menu item. The lock screen or PIN gate appears automatically — enter your PIN to unlock. It stays unlocked for the rest of the session, or until whatever it lives in (the QAM, the Steam Menu, etc.) is closed and reopened.
-
-### Re-locking a game
-
-After unlocking, a small lock icon appears next to the Play button on the game's page. Tap it to re-lock the game immediately.
-
-## Lock Method
-
-Deck Locker currently unlocks with a **PIN**. Under **Lock Method** in the main panel, you can already see the other methods planned — **Password**, **Pattern**, **Tap Code**, and **Controller Code** (a button-combination unlock, similar to the Deck's own native lock screen) — each marked *Soon*. The setting is already there and will switch over cleanly once each method is built; no PIN is lost or reset when that happens.
-
-## Customization
-
-Tap **Customization** in the Deck Locker panel to adjust:
-
-| Setting | Description |
-|---|---|
-| Key Shape | Square, Rounded, or Circle keypad buttons |
-| Corner Roundness | Slider for rounded key corner radius |
-| Key Size | Size of each keypad button |
-| Number Size | Size of the digits on each key |
-| Glass Effect | Semi-transparent blurred keypad background |
-| Swap Keypad Side | Move the keypad to the right, game art to the left |
-| Keypad Only | Hide the game cover art and show just the centered keypad |
-| Blurred Background | Show the game's hero art blurred behind the lock screen |
-| Background Blur / Opacity | Controls the hero art blur and dimming |
-| Re-lock Animation | Animated lock icon when manually re-locking |
-| Enable Locked Badges | Show a lock icon on locked games' covers in Home, Recent, and the Library |
-| Badge Position | Top Left, Top Right, Center, Bottom Left, or Bottom Right |
-
-Under **More Settings** in the main panel:
-
-| Setting | Description |
-|---|---|
-| Lock Decky Panel | Require a PIN before the Decky plugin browser tab is shown |
-| Re-lock on Sleep | Lock everything again when the Steam Deck goes to sleep |
-| Re-lock When Leaving Game | Ask for the PIN again each time you revisit a locked game's page |
+Run `scripts/reset-decklocker.sh` from a terminal in Desktop Mode. It wipes Deck Locker back to a clean install (no PIN, everything unlocked) after confirming with you — a backup of your old settings is kept alongside it.
 
 ## Notes
 
-- Locking prevents launch or access from the library page, context menus, Home shortcuts, and other entry points. It is not a security guarantee against a determined user with direct filesystem access.
-- The PIN is stored as a SHA-256 hash in `<DECKY_PLUGIN_SETTINGS_DIR>/settings.json`.
-- Unlock state resets each time Steam restarts (and optionally on sleep, if **Re-lock on Sleep** is on).
+- This isn't a security guarantee against someone with direct filesystem access — it blocks normal in-UI access, not a determined attacker.
+- Your PIN is stored as a SHA-256 hash locally; it's never sent anywhere.
+- Everything unlocks again on a Steam restart (and optionally on sleep, if you enable that).
 
 ## Building from source
 
