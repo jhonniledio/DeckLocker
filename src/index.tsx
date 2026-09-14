@@ -1,5 +1,6 @@
 import {
   ButtonItem,
+  Field,
   PanelSection,
   PanelSectionRow,
   ToggleField,
@@ -18,14 +19,31 @@ import {
   footerClasses,
   appActionButtonClasses,
   SliderField,
+  DropdownItem,
+  findModuleChild,
+  findModuleByExport,
+  showContextMenu,
+  QuickAccessTab,
+  getReactRoot,
 } from "@decky/ui";
 import { callable, definePlugin, routerHook } from "@decky/api";
 import { useState, useEffect, useRef, cloneElement, ReactNode, RefObject } from "react";
-import { FaLock, FaBackspace, FaLockOpen, FaChevronRight, FaChevronDown, FaTh, FaCheck, FaPalette, FaUndo } from "react-icons/fa";
+import { FaLock, FaBackspace, FaLockOpen, FaChevronRight, FaChevronLeft, FaChevronDown, FaTh, FaCheck, FaPalette, FaUndo, FaGithub, FaQrcode } from "react-icons/fa";
+
+// Which credential type protects locked content. "pin" is the only one implemented;
+// the rest are reserved for future lock methods and already round-trip through
+// settings (see LOCK_METHOD_OPTIONS and the Lock Method picker in Content() below) so
+// adding one is a matter of building its own credential-entry UI and backend
+// set_/check_ pair (see the comment above set_pin/check_pin in main.py), not
+// restructuring settings again.
+type LockMethod = "pin" | "password" | "pattern" | "tap_code" | "controller_code";
 
 interface DeckLockerSettings {
   global_lock_enabled: boolean;
   locked_apps: string[];
+  locked_plugins: string[];
+  locked_qam_tabs: string[];
+  locked_main_menu_items: string[];
   pin_set: boolean;
   qam_lock_enabled: boolean;
   keypad_corner_radius: number;
@@ -33,18 +51,38 @@ interface DeckLockerSettings {
   lockscreen_bg_blur_px: number;
   lockscreen_bg_opacity_percent: number;
   relock_animation_enabled: boolean;
-  keypad_circle_shape: boolean;
+  keypad_shape: "square" | "rounded" | "circle";
   keypad_glass_effect: boolean;
   keypad_on_right: boolean;
   relock_on_sleep: boolean;
   relock_on_exit: boolean;
   decky_panel_lock_enabled: boolean;
+  hide_game_art: boolean;
+  keypad_key_size: number;
+  keypad_font_size: number;
+  locked_badge_enabled: boolean;
+  locked_badge_position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
+  lock_method: LockMethod;
 }
 
 interface AppInfo {
   appid: string;
   display_name: string;
 }
+
+// Lock Method picker options (see the "Lock Method" section in Content() below). Only
+// "pin" is selectable today — the rest are listed so the setting and UI already exist
+// once their own credential-entry screens are built; selecting one before then is a
+// no-op (see the picker's onChange).
+const LOCK_METHOD_OPTIONS: { data: LockMethod; label: string; implemented: boolean }[] = [
+  { data: "pin", label: "PIN", implemented: true },
+  { data: "password", label: "Password (Soon)", implemented: false },
+  { data: "pattern", label: "Pattern (Soon)", implemented: false },
+  { data: "tap_code", label: "Tap Code (Soon)", implemented: false },
+  // Unlocks with a sequence of controller button presses (A/B/X/Y, bumpers, triggers,
+  // d-pad), similar to the Deck's own native lock screen's button-combo unlock.
+  { data: "controller_code", label: "Controller Code (Soon)", implemented: false },
+];
 
 const getSettings = callable<[], DeckLockerSettings>("get_settings");
 const setGlobalLock = callable<[enabled: boolean], DeckLockerSettings>("set_global_lock");
@@ -53,6 +91,9 @@ const setCustomization = callable<[updates: Partial<DeckLockerSettings>], DeckLo
 const setPin = callable<[pin: string], boolean>("set_pin");
 const checkPin = callable<[pin: string], boolean>("check_pin");
 const toggleApp = callable<[app_id: string, locked: boolean], string[]>("toggle_app");
+const togglePluginLock = callable<[plugin_name: string, locked: boolean], string[]>("toggle_plugin_lock");
+const toggleQamTabLock = callable<[tab_name: string, locked: boolean], string[]>("toggle_qam_tab_lock");
+const toggleMainMenuItemLock = callable<[item_name: string, locked: boolean], string[]>("toggle_main_menu_item_lock");
 const getLocalArtwork = callable<[app_id: string], string>("get_local_artwork");
 const getLocalHeroArtwork = callable<[app_id: string], string>("get_local_hero_artwork");
 
@@ -70,14 +111,13 @@ const unlockedThisSession = new Set<string>();
 // Games whose post-unlock settling delay has already run — skips the delay on revisits.
 const settledThisSession = new Set<string>();
 
-// QAM panel unlock state. Persists across tab switches within the same QAM session
-// (Content unmounts/remounts on every tab switch) but resets when the panel closes.
-// A timer approximates "panel closed" since there is no direct close event.
+// QAM panel unlock state. Persists once unlocked — closing/reopening the QAM no longer
+// re-locks it; only an explicit relock event (sleep, if Re-lock on Sleep is enabled)
+// resets it.
 let qamUnlockedThisSession = false;
-let qamCloseResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Decky-panel gate state — true means the next QAM open requires a PIN before showing
-// any plugins. Resets to locked each time the QAM closes.
+// Decky-panel gate state — true means the next time the Decky tab becomes active
+// requires a PIN before showing any plugins. Persists once unlocked, same as above.
 let deckyQamLocked = true;
 const deckyQamLockListeners = new Set<() => void>();
 function notifyDeckyQamLockChange() {
@@ -156,6 +196,30 @@ function playUnlockSound() {
   } catch (e) {
     console.error("DeckLocker: failed to play unlock sound", e);
   }
+}
+
+const DECKLOCKER_GITHUB_URL = "https://github.com/jhonniledio/DeckLocker";
+
+// QR code for the GitHub project link (see the "Open Project" row in Content() below).
+// Generated via a third-party service (api.qrserver.com) rather than a bundled QR
+// library — the only data sent is this project's own public URL, nothing user-specific.
+function ProjectQrModal({ closeModal }: { closeModal?: () => void }) {
+  return (
+    <ConfirmModal strTitle="Scan to Open Project" onOK={closeModal} bAlertDialog>
+      <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+        <img
+          src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(DECKLOCKER_GITHUB_URL)}`}
+          alt="QR code linking to the Deck Locker GitHub project"
+          width={220}
+          height={220}
+          style={{ borderRadius: "8px", background: "#fff", padding: "8px" }}
+        />
+      </div>
+      <div style={{ textAlign: "center", opacity: 0.8, fontSize: "13px", wordBreak: "break-all" }}>
+        {DECKLOCKER_GITHUB_URL}
+      </div>
+    </ConfirmModal>
+  );
 }
 
 // Modal for setting or changing the PIN. Requires at least 4 digits and a matching
@@ -282,7 +346,7 @@ function PinLockScreen({
   onUnlocked,
   settling,
   onDismiss,
-  mode = "game",
+  libraryMode,
 }: {
   appid: string;
   appName: string;
@@ -290,7 +354,12 @@ function PinLockScreen({
   onUnlocked?: () => void;
   settling?: boolean;
   onDismiss?: () => void;
-  mode?: "game" | "system";
+  // Used for the Library route lock (see openLibraryRouteLockModal): same full-screen
+  // keypad layout as a game's own lock screen, but there's no real app behind it —
+  // skips art loading (no appid to look up) and app-specific unlock/cancel side effects
+  // (unlockedThisSession/terminateAppAggressively, both meant for actual running games),
+  // and shows a plain text label where the cover art would otherwise go.
+  libraryMode?: boolean;
 }) {
   const [digits, setDigits] = useState<string[]>([]);
   const [focusedKeyKey, setFocusedKeyKey] = useState<string | null>(null);
@@ -300,7 +369,7 @@ function PinLockScreen({
   const [error, setError] = useState("");
   const [pinStatus, setPinStatus] = useState<"neutral" | "correct" | "incorrect">("neutral");
   const [checking, setChecking] = useState(false);
-  const [artSource, setArtSource] = useState<"capsule" | "header" | "local" | "none">("local");
+  const [artSource, setArtSource] = useState<"capsule" | "header" | "local" | "none">(libraryMode ? "none" : "local");
   const [localArtUri, setLocalArtUri] = useState("");
   const [imgLoaded, setImgLoaded] = useState(false);
   const [lockOpen, setLockOpen] = useState(false);
@@ -319,7 +388,7 @@ function PinLockScreen({
 
   // Loads game cover art from the local Steam cache first; falls back to CDN.
   useEffect(() => {
-    if (artSource !== "local") return;
+    if (libraryMode || artSource !== "local") return;
     let cancelled = false;
     (async () => {
       const uri = await getLocalArtwork(appid);
@@ -350,7 +419,7 @@ function PinLockScreen({
     setChecking(false);
     if (ok) {
       playUnlockSound();
-      if (appid) unlockedThisSession.add(appid);
+      if (!libraryMode && appid) unlockedThisSession.add(appid);
       setPinStatus("correct");
       onUnlocked?.();
       closeModal?.();
@@ -367,28 +436,26 @@ function PinLockScreen({
   };
 
   const onCancel = () => {
-    if (mode !== "system") {
-      terminateAppAggressively(appid);
-      closeModal?.();
-      onDismiss?.();
-      Navigation.NavigateBack();
-    }
-    // In system mode, cancel is a no-op — user must enter the correct PIN or
-    // physically close the QAM to exit.
+    if (!libraryMode) terminateAppAggressively(appid);
+    // Navigate away before closing the gate itself, not after — closing first left the
+    // real page behind it visible for a frame before the navigation actually took over.
+    Navigation.NavigateBack();
+    closeModal?.();
+    onDismiss?.();
   };
 
-  // Acts as Delete while digits are entered; becomes Cancel in game mode or a
-  // no-op lock icon in system mode when the field is empty.
+  // Acts as Delete while digits are entered, Cancel when the field is empty.
   const onBottomLeftKey = () => {
     if (digits.length > 0) {
       backspace();
-    } else if (mode !== "system") {
+    } else {
       onCancel();
     }
   };
 
   const glassEffect = cachedSettings?.keypad_glass_effect ?? false;
   const keypadOnRight = cachedSettings?.keypad_on_right ?? false;
+  const hideGameArt = cachedSettings?.hide_game_art ?? false;
   // Shared background applied to keypad cells and the art placeholder so they match visually.
   const panelBg = glassEffect
     ? {
@@ -400,30 +467,40 @@ function PinLockScreen({
       }
     : { background: "rgba(255,255,255,0.06)" };
 
-  // Circle shape forces cells square so borderRadius:50% produces true circles,
-  // bypassing the corner-radius slider.
-  const circleShape = cachedSettings?.keypad_circle_shape ?? false;
+  const keypadShape = cachedSettings?.keypad_shape ?? "rounded";
+  // Circle shape shrinks the visible cell within its grid slot (same ~78% ratio as the
+  // original fixed 72/92px sizes) so circles keep a gap between them, like square keys.
+  const keySize = cachedSettings?.keypad_key_size ?? 80;
+  const circleKeySize = Math.round(keySize * (72 / 92));
+  const keyBorderRadius =
+    keypadShape === "circle" ? "50%" : keypadShape === "square" ? "0px" : `${cachedSettings?.keypad_corner_radius ?? 14}px`;
+
+  // Digit font size is user-adjustable; the smaller hint labels (CANCEL/OK) and the
+  // backspace icon scale proportionally so the keypad stays visually balanced.
+  const keyFontSize = cachedSettings?.keypad_font_size ?? 22;
+  const hintFontSize = Math.round(keyFontSize * (14 / 22));
+  const backspaceIconSize = Math.round(keyFontSize * (20 / 22));
 
   // Controller mapping: A = select (Focusable default), B = Delete/Cancel, X = OK.
   const keypadButtons: { key: string; label: string | ReactNode; hint?: string; onClick: () => void; fontSize: string }[] = [
-    { key: "1", label: "1", onClick: () => press("1"), fontSize: "22px" },
-    { key: "2", label: "2", onClick: () => press("2"), fontSize: "22px" },
-    { key: "3", label: "3", onClick: () => press("3"), fontSize: "22px" },
-    { key: "4", label: "4", onClick: () => press("4"), fontSize: "22px" },
-    { key: "5", label: "5", onClick: () => press("5"), fontSize: "22px" },
-    { key: "6", label: "6", onClick: () => press("6"), fontSize: "22px" },
-    { key: "7", label: "7", onClick: () => press("7"), fontSize: "22px" },
-    { key: "8", label: "8", onClick: () => press("8"), fontSize: "22px" },
-    { key: "9", label: "9", onClick: () => press("9"), fontSize: "22px" },
+    { key: "1", label: "1", onClick: () => press("1"), fontSize: `${keyFontSize}px` },
+    { key: "2", label: "2", onClick: () => press("2"), fontSize: `${keyFontSize}px` },
+    { key: "3", label: "3", onClick: () => press("3"), fontSize: `${keyFontSize}px` },
+    { key: "4", label: "4", onClick: () => press("4"), fontSize: `${keyFontSize}px` },
+    { key: "5", label: "5", onClick: () => press("5"), fontSize: `${keyFontSize}px` },
+    { key: "6", label: "6", onClick: () => press("6"), fontSize: `${keyFontSize}px` },
+    { key: "7", label: "7", onClick: () => press("7"), fontSize: `${keyFontSize}px` },
+    { key: "8", label: "8", onClick: () => press("8"), fontSize: `${keyFontSize}px` },
+    { key: "9", label: "9", onClick: () => press("9"), fontSize: `${keyFontSize}px` },
     {
       key: "bottomleft",
-      label: digits.length > 0 ? <FaBackspace size={20} /> : (mode === "system" ? <FaLock size={16} /> : "CANCEL"),
-      hint: (mode !== "system" || digits.length > 0) ? "B" : undefined,
+      label: digits.length > 0 ? <FaBackspace size={backspaceIconSize} /> : "CANCEL",
+      hint: "B",
       onClick: onBottomLeftKey,
-      fontSize: "14px",
+      fontSize: `${hintFontSize}px`,
     },
-    { key: "0", label: "0", onClick: () => press("0"), fontSize: "22px" },
-    { key: "ok", label: "OK", hint: "X", onClick: onOk, fontSize: "14px" },
+    { key: "0", label: "0", onClick: () => press("0"), fontSize: `${keyFontSize}px` },
+    { key: "ok", label: "OK", hint: "X", onClick: onOk, fontSize: `${hintFontSize}px` },
   ];
 
   return (
@@ -435,9 +512,9 @@ function PinLockScreen({
         background: "#0e1114",
         zIndex: 999999,
         display: "flex",
-        flexDirection: mode === "system" ? "column" : (keypadOnRight ? "row-reverse" : "row"),
-        alignItems: mode === "system" ? "center" : undefined,
-        justifyContent: mode === "system" ? "center" : undefined,
+        flexDirection: hideGameArt ? "column" : (keypadOnRight ? "row-reverse" : "row"),
+        alignItems: hideGameArt ? "center" : undefined,
+        justifyContent: hideGameArt ? "center" : undefined,
         color: "#fff",
       }}
     >
@@ -458,7 +535,7 @@ function PinLockScreen({
       `}</style>
 
       {/* Optional hero art background placed behind both panels, blurred and dimmed per settings. */}
-      {mode !== "system" && cachedSettings?.lockscreen_hero_bg_enabled && heroBgUri && (
+      {cachedSettings?.lockscreen_hero_bg_enabled && heroBgUri && (
         <div
           style={{
             position: "absolute",
@@ -473,7 +550,7 @@ function PinLockScreen({
         />
       )}
       {/* Hidden probe image used to detect CDN failures; background-image has no onError of its own. */}
-      {mode !== "system" && cachedSettings?.lockscreen_hero_bg_enabled && heroBgSource === "cdn" && (
+      {cachedSettings?.lockscreen_hero_bg_enabled && heroBgSource === "cdn" && (
         <img
           src={`https://cdn.akamai.steamstatic.com/steam/apps/${appid}/library_hero.jpg`}
           onError={() => setHeroBgSource("none")}
@@ -481,19 +558,10 @@ function PinLockScreen({
         />
       )}
 
-      {/* System-mode header: lock icon + title + instruction shown above keypad. */}
-      {mode === "system" && (
-        <div style={{ textAlign: "center", marginBottom: "24px", zIndex: 1 }}>
-          <FaLock size={36} style={{ opacity: 0.9 }} />
-          <div style={{ fontSize: "20px", fontWeight: 700, marginTop: "10px" }}>Deck Locker</div>
-          <div style={{ fontSize: "13px", opacity: 0.55, marginTop: "4px" }}>Enter PIN to access plugins</div>
-        </div>
-      )}
-
       {/* Left panel: status text, PIN dot indicator, and numeric keypad grid. */}
       <div
         style={{
-          width: mode === "system" ? "auto" : "50%",
+          width: hideGameArt ? "auto" : "50%",
           minWidth: 0,
           boxSizing: "border-box",
           display: "flex",
@@ -561,8 +629,8 @@ function PinLockScreen({
           onSecondaryButton={onOk}
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(3, 92px)",
-            gridAutoRows: "72px",
+            gridTemplateColumns: `repeat(3, ${keySize}px)`,
+            gridAutoRows: `${keySize}px`,
             gap: "14px",
             justifyItems: "center",
             alignItems: "center",
@@ -572,14 +640,14 @@ function PinLockScreen({
             <div
               key={btn.key}
               style={{
-                width: circleShape ? "72px" : "92px",
-                height: "72px",
+                width: keypadShape === "circle" ? `${circleKeySize}px` : `${keySize}px`,
+                height: keypadShape === "circle" ? `${circleKeySize}px` : `${keySize}px`,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 overflow: "hidden",
                 boxSizing: "border-box",
-                borderRadius: circleShape ? "50%" : `${cachedSettings?.keypad_corner_radius ?? 14}px`,
+                borderRadius: keyBorderRadius,
                 ...panelBg,
               }}
             >
@@ -611,8 +679,8 @@ function PinLockScreen({
                   <span
                     style={{
                       fontSize: btn.fontSize,
-                      lineHeight: "22px",
-                      height: "22px",
+                      lineHeight: `${keyFontSize}px`,
+                      height: `${keyFontSize}px`,
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
@@ -648,7 +716,7 @@ function PinLockScreen({
       </div>
 
       {/* Right panel: game cover art (local → capsule CDN → header CDN) and title. */}
-      {mode !== "system" && <div
+      {!hideGameArt && <div
         style={{
           width: "50%",
           minWidth: 0,
@@ -705,7 +773,12 @@ function PinLockScreen({
               style={{ maxWidth: "320px", maxHeight: "220px", width: "auto", height: "auto", objectFit: "contain", borderRadius: "8px", opacity: imgLoaded ? 1 : 0, transition: "opacity 0.2s" }}
             />
           )}
-          {artSource === "none" && <FaLock size={64} />}
+          {artSource === "none" && !libraryMode && <FaLock size={64} />}
+          {libraryMode && (
+            <div style={{ padding: "0 16px", textAlign: "center", fontSize: "18px", fontWeight: 600, opacity: 0.85 }}>
+              View more in your Library
+            </div>
+          )}
         </div>
 
         <div style={{ fontSize: "22px", fontWeight: 600, textAlign: "center" }}>{appName}</div>
@@ -732,75 +805,1524 @@ function useUnlockedThisSession(appId: string): boolean {
   return unlocked;
 }
 
-// Global component that blocks access to all Decky plugins until a PIN is entered.
-// Activated when decky_panel_lock_enabled is on and the QAM opens. Registers for
-// QAM visibility so it shows the gate on open and re-locks on close.
-function GlobalDeckyQamGate() {
-  const [gateActive, setGateActive] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
+// Whether the Decky-panel PIN gate is currently shown, substituted in place of the
+// real Decky tab panel (plugin list / active plugin). Read synchronously by
+// DeckyTabGate (a component actually mounted inside the QAM's own render tree) rather
+// than a routerHook.addGlobalComponent overlay — the QAM's content renders inside a
+// separate, natively-composited Steam browser view, so a same-window overlay can never
+// visually appear on top of it no matter its z-index.
+let deckyPanelGateVisible = false;
+
+// Cache of the QAM tab panel's actual on-screen width, captured from a tab that renders
+// its width correctly (i.e. any DeckyPanelPinPrompt instance not opting into
+// forceCollapsedWidth). The Friends tab is the one exception: Steam gives its container
+// a dynamic width tied to its own (unmounted, since we substitute its content) expanded/
+// collapsed chat state, so left alone it renders at that tab's "expanded" width even
+// while the QAM itself is still showing the narrow collapsed panel. Reusing a width
+// measured from a normal tab and forcing it onto Friends' container (see
+// forceCollapsedWidth below) sidesteps needing to know Steam's own expand/collapse state.
+let knownTabPanelWidthPx: number | null = null;
+
+// Simple text-field-and-button PIN prompt, same style as the "Lock This Plugin" gate —
+// as opposed to PinLockScreen's full numeric keypad, which doesn't fit well substituted
+// into the QAM's own (narrower) panel area alongside the rest of the QAM's tabs.
+function DeckyPanelPinPrompt({
+  title,
+  plainTitle,
+  forceCollapsedWidth,
+  onBack,
+  onUnlocked,
+}: {
+  title?: string;
+  // Renders `title` as plain bold text instead of QAM's own title-bar styling
+  // (staticClasses.Title) — used for the Main Menu, where every real row is just plain
+  // text with no special background of its own, so the QAM-style title bar looked out
+  // of place (the original "only the title has a background" complaint).
+  plainTitle?: boolean;
+  forceCollapsedWidth?: boolean;
+  onBack?: () => void;
+  onUnlocked: () => void;
+}) {
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState("");
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    // Show gate when QAM opens (if decky_panel_lock_enabled + pin_set + still locked).
-    // Re-lock and hide gate when QAM closes.
-    let qamHook: any;
-    const handleQamVisible = (open: boolean) => {
-      if (open) {
-        getSettingsCached().then((s) => {
-          if (s.decky_panel_lock_enabled && s.pin_set && deckyQamLocked) {
-            setGateActive(true);
-          }
-        }).catch(() => {});
-      } else {
-        setGateActive(false);
-        setTimeout(() => {
-          if (cachedSettings?.decky_panel_lock_enabled) {
-            deckyQamLocked = true;
-          }
-        }, 400);
-      }
-    };
-    const qamApis = ["RegisterForQuickAccessMenuVisible", "RegisterForQuickAccessMenuVisibilityChange"];
-    for (const apiName of qamApis) {
-      try {
-        const fn = (window as any).SteamClient?.UI?.[apiName];
-        if (typeof fn === "function") {
-          qamHook = fn.call((window as any).SteamClient.UI, handleQamVisible);
-          console.log("DeckLocker: registered QAM hook via SteamClient.UI." + apiName);
-          break;
+    const root = rootRef.current;
+    if (!root) return;
+
+    if (!forceCollapsedWidth) {
+      // A normally-sized tab (Decky, other plugins, other built-in tabs) — trust its
+      // ambient container width as the reference for Friends to match.
+      const w = root.parentElement?.getBoundingClientRect().width;
+      if (w && w > 0) knownTabPanelWidthPx = w;
+      return;
+    }
+
+    // Friends: walk up until we find (and clamp) any ancestor whose inline width is
+    // wider than the known-good collapsed panel width, and keep re-clamping if Steam's
+    // own code changes it later (e.g. in response to the chat-expand state it thinks
+    // it's in).
+    const applyClamp = () => {
+      if (!knownTabPanelWidthPx) return;
+      let el: HTMLElement | null = root.parentElement;
+      let hops = 0;
+      while (el && hops < 8) {
+        const inlineWidth = el.style.width;
+        const parsed = inlineWidth ? parseFloat(inlineWidth) : NaN;
+        if (!Number.isNaN(parsed) && parsed > knownTabPanelWidthPx + 8) {
+          el.style.setProperty("width", `${knownTabPanelWidthPx}px`, "important");
+          el.style.setProperty("max-width", `${knownTabPanelWidthPx}px`, "important");
         }
-      } catch (e) {
-        console.warn("DeckLocker: SteamClient.UI." + apiName + " failed:", e);
+        el = el.parentElement;
+        hops++;
       }
-    }
-    if (!qamHook) {
-      console.error("DeckLocker: no QAM visibility hook could be registered");
-    }
-
-    // Hide gate when unlock succeeds (notifyDeckyQamLockChange fires the listener).
-    const onLockChange = () => {
-      if (!deckyQamLocked) setGateActive(false);
+      root.style.setProperty("width", `${knownTabPanelWidthPx}px`, "important");
+      root.style.setProperty("max-width", `${knownTabPanelWidthPx}px`, "important");
     };
-    deckyQamLockListeners.add(onLockChange);
 
+    applyClamp();
+    const observer = new MutationObserver(applyClamp);
+    let node: HTMLElement | null = root.parentElement;
+    let hops = 0;
+    while (node && hops < 8) {
+      observer.observe(node, { attributes: true, attributeFilter: ["style", "class"] });
+      node = node.parentElement;
+      hops++;
+    }
+    return () => observer.disconnect();
+  }, [forceCollapsedWidth]);
+
+  // Hides the real typed digits (bIsPassword doesn't actually mask text in Steam's UI)
+  // so the dot overlay below is the only thing visibly showing PIN length. The dots use
+  // mix-blend-mode: difference instead of forcing a fixed background color — Steam's
+  // native focus style turns the input's background white, and a hardcoded dark
+  // background would both fight that and drift from whatever theme is active; a
+  // difference blend stays visible against light or dark automatically.
+  useEffect(() => {
+    const input = wrapperRef.current?.querySelector("input") as HTMLInputElement | null;
+    if (input) {
+      input.style.color = "transparent";
+      input.style.caretColor = "transparent";
+      (input.style as any).WebkitTextFillColor = "transparent";
+    }
+  }, [pin]);
+
+  const onSubmit = async () => {
+    const ok = await checkPin(pin);
+    if (ok) {
+      onUnlocked();
+    } else {
+      setError("Incorrect PIN");
+      setPin("");
+    }
+  };
+
+  return (
+    <div ref={rootRef} style={{ width: "100%", maxWidth: "100%", boxSizing: "border-box" }}>
+      {(title || onBack) && (
+        <Focusable
+          className={plainTitle ? undefined : staticClasses.Title}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            width: "100%",
+            boxSizing: "border-box",
+            paddingLeft: onBack ? "16px" : undefined,
+            paddingRight: "16px",
+            position: "sticky",
+            top: "0px",
+            fontWeight: plainTitle ? "bold" : undefined,
+          }}
+        >
+          {onBack && (
+            <DialogButton
+              onClick={onBack}
+              style={{
+                minWidth: 0,
+                width: "28px",
+                height: "28px",
+                padding: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <FaChevronLeft />
+            </DialogButton>
+          )}
+          {title && <div style={{ marginRight: "auto", flex: 0.9 }}>{title}</div>}
+        </Focusable>
+      )}
+      <div style={{ paddingTop: title || onBack ? "16px" : 0, width: "100%", boxSizing: "border-box" }}>
+        <PanelSection>
+          <PanelSectionRow>
+            <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Enter PIN</div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div ref={(el) => { wrapperRef.current = el; }} style={{ position: "relative" }}>
+              <TextField
+                value={pin}
+                onChange={(e) => {
+                  setError("");
+                  setPin(e.target.value.replace(/\D/g, ""));
+                }}
+                bIsPassword={true}
+                focusOnMount={true}
+              />
+              {pin.length > 0 && (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: "12px",
+                    top: 0,
+                    bottom: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    pointerEvents: "none",
+                    mixBlendMode: "difference",
+                  }}
+                >
+                  {pin.split("").map((_, i) => (
+                    <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </PanelSectionRow>
+          {error && (
+            <PanelSectionRow>
+              <div style={{ color: "#f44336", fontSize: "13px" }}>{error}</div>
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <DialogButton onClick={onSubmit} style={{ width: "100%", marginTop: "12px" }}>
+              Unlock
+            </DialogButton>
+          </PanelSectionRow>
+        </PanelSection>
+      </div>
+    </div>
+  );
+}
+
+// Wraps Decky's own tab panel so the PIN gate can render INSIDE the QAM's own tree,
+// in place of the plugin list, instead of as a same-window overlay (see above).
+function DeckyTabGate({ children }: { children: ReactNode }) {
+  const [locked, setLocked] = useState(deckyPanelGateVisible);
+
+  useEffect(() => {
+    const listener = () => setLocked(deckyPanelGateVisible);
+    listener();
+    deckyQamLockListeners.add(listener);
     return () => {
-      qamHook?.unregister?.();
-      deckyQamLockListeners.delete(onLockChange);
+      deckyQamLockListeners.delete(listener);
     };
   }, []);
 
-  if (!gateActive) return <div ref={ref} style={{ display: "none" }} />;
+  if (locked) {
+    return (
+      <DeckyPanelPinPrompt
+        title="Decky"
+        onUnlocked={() => {
+          deckyQamLocked = false;
+          deckyPanelGateVisible = false;
+          notifyDeckyQamLockChange();
+        }}
+      />
+    );
+  }
+  return <>{children}</>;
+}
+
+// Other installed plugins the user has chosen to lock — unlocked until the whole QAM
+// is closed (same persistence model as Lock Decky Panel), not the game/session model.
+const unlockedPluginsThisSession = new Set<string>();
+const pluginLockListeners = new Map<string, Set<() => void>>();
+function notifyPluginLockChange(name: string) {
+  pluginLockListeners.get(name)?.forEach((fn) => fn());
+}
+
+// Wraps another installed plugin's own content (substituted in place of it, the same
+// way DeckyTabGate substitutes Decky's own tab panel) so it requires a PIN before
+// showing, without needing to patch that plugin's own component at all.
+function LockedPluginGate({
+  pluginName,
+  title,
+  forceCollapsedWidth,
+  children,
+}: {
+  pluginName: string;
+  title?: string;
+  forceCollapsedWidth?: boolean;
+  children: ReactNode;
+}) {
+  const [unlocked, setUnlocked] = useState(() => unlockedPluginsThisSession.has(pluginName));
+
+  useEffect(() => {
+    const listener = () => setUnlocked(unlockedPluginsThisSession.has(pluginName));
+    if (!pluginLockListeners.has(pluginName)) pluginLockListeners.set(pluginName, new Set());
+    pluginLockListeners.get(pluginName)!.add(listener);
+    listener();
+    return () => {
+      pluginLockListeners.get(pluginName)?.delete(listener);
+    };
+  }, [pluginName]);
+
+  if (unlocked) return <>{children}</>;
 
   return (
-    <PinLockScreen
-      appid=""
-      appName="Deck Locker"
-      mode="system"
+    <DeckyPanelPinPrompt
+      title={title}
+      forceCollapsedWidth={forceCollapsedWidth}
       onUnlocked={() => {
-        deckyQamLocked = false;
-        notifyDeckyQamLockChange();
+        unlockedPluginsThisSession.add(pluginName);
+        notifyPluginLockChange(pluginName);
       }}
     />
   );
+}
+
+// Finds Decky Loader's own internal plugin-state Context by walking the live React
+// tree from the true app root and matching its value's shape (has `plugins` and
+// `pluginOrder` arrays) — this Context (frontend/src/components/DeckyState.tsx in
+// SteamDeckHomebrew/decky-loader) isn't exported to plugins at all, unlike the Steam
+// Client internals used elsewhere in this file, so there's no module or prop name to
+// search for; duck-typing the value shape is the only way in. Returns null if it can't
+// be found (e.g. after a Decky Loader update changes this shape).
+let loggedDeckyStateResult = false;
+function getDeckyStateValue(): { plugins: { name: string; icon?: ReactNode; content?: ReactNode }[] } | null {
+  try {
+    const root = getReactRoot(document.getElementById("root") as any);
+    if (!root) {
+      if (!loggedDeckyStateResult) {
+        loggedDeckyStateResult = true;
+        console.warn("DeckLocker: getReactRoot found nothing while looking for Decky's plugin state");
+      }
+      return null;
+    }
+    const node = findInReactTree(root, (n: any) => {
+      const val = n?.props?.value ?? n?.memoizedProps?.value;
+      return !!val && Array.isArray(val.plugins) && Array.isArray(val.pluginOrder);
+    });
+    const value = (node?.props?.value ?? node?.memoizedProps?.value) ?? null;
+    if (!loggedDeckyStateResult) {
+      loggedDeckyStateResult = true;
+      if (!value) {
+        console.warn("DeckLocker: could not locate Decky's plugin state Context in the React tree");
+      }
+    }
+    return value;
+  } catch (e) {
+    console.error("DeckLocker: failed to read Decky's plugin list", e);
+    return null;
+  }
+}
+
+// Wraps (or unwraps) each OTHER installed plugin's own `content` with LockedPluginGate
+// based on the current locked_plugins setting — mutating the plugin object Decky Loader
+// itself holds, the same in-place-mutation technique TabsHook uses to install each
+// plugin's panel in the first place. Idempotent: safe to call repeatedly (e.g. every
+// time the Decky tab becomes active) to pick up newly installed/locked plugins.
+function applyPluginLocks() {
+  const state = getDeckyStateValue();
+  if (!state) return;
+  const lockedNames = new Set(cachedSettings?.locked_plugins ?? []);
+  for (const plugin of state.plugins) {
+    if (!plugin || plugin.name === "Deck Locker") continue;
+    const p = plugin as any;
+    if (p.__decklockerOriginalContent === undefined) {
+      p.__decklockerOriginalContent = p.content;
+    }
+    const shouldLock = lockedNames.has(plugin.name);
+    const isLocked = p.__decklockerLocked === true;
+    if (shouldLock && !isLocked) {
+      p.content = <LockedPluginGate pluginName={plugin.name}>{p.__decklockerOriginalContent}</LockedPluginGate>;
+      p.__decklockerLocked = true;
+    } else if (!shouldLock && isLocked) {
+      p.content = p.__decklockerOriginalContent;
+      p.__decklockerLocked = false;
+    }
+  }
+}
+
+// Steam's own built-in QAM tabs that can be individually locked, alongside Decky
+// plugins. Unlike plugins (found via getDeckyStateValue's React-tree walk), these
+// already sit in the same `tabs` array the Decky tab itself is found in, so they're
+// wrapped inline wherever that array is available, with no separate lookup needed.
+// showTitle: only Friends lacks its own native title once its content is swapped out
+// for the PIN prompt — every other built-in tab already renders its own title, so
+// injecting one there would show two titles at once.
+const BUILTIN_LOCKABLE_TABS: { id: number; name: string; showTitle?: boolean }[] = [
+  { id: QuickAccessTab.Notifications, name: "Notifications" },
+  { id: QuickAccessTab.Friends, name: "Friends", showTitle: true },
+  { id: QuickAccessTab.Settings, name: "Quick Settings" },
+  { id: QuickAccessTab.Perf, name: "Performance" },
+  { id: QuickAccessTab.Help, name: "Help" },
+  { id: QuickAccessTab.Music, name: "Music" },
+  { id: QuickAccessTab.RemotePlayTogetherControls, name: "Remote Play Together" },
+  { id: QuickAccessTab.VoiceChat, name: "Voice Chat" },
+];
+// Namespaced so a built-in tab's name can never collide with an actual plugin's name
+// in the shared unlockedPluginsThisSession set (reused as-is for both — same "unlock
+// once, re-lock on QAM close" model applies equally to either kind of lock).
+function builtinTabLockKey(name: string): string {
+  return `tab:${name}`;
+}
+
+// Wraps (or unwraps) each built-in tab's own panel with LockedPluginGate, the same
+// in-place mutation applyPluginLocks uses for Decky plugins — just operating directly
+// on the tabs array already in scope here instead of a separate lookup.
+function applyBuiltinTabLocks(tabs: any[]) {
+  const lockedNames = new Set(cachedSettings?.locked_qam_tabs ?? []);
+  for (const { id, name, showTitle } of BUILTIN_LOCKABLE_TABS) {
+    const entry = tabs?.find((t: any) => t?.key === id);
+    if (!entry) continue;
+    if (entry.__decklockerOriginalPanel === undefined) {
+      entry.__decklockerOriginalPanel = entry.panel;
+    }
+    const shouldLock = lockedNames.has(name);
+    const isLocked = entry.__decklockerTabLocked === true;
+    if (shouldLock && !isLocked) {
+      entry.panel = (
+        <LockedPluginGate
+          pluginName={builtinTabLockKey(name)}
+          title={showTitle ? name : undefined}
+          forceCollapsedWidth={name === "Friends"}
+        >
+          {entry.__decklockerOriginalPanel}
+        </LockedPluginGate>
+      );
+      entry.__decklockerTabLocked = true;
+    } else if (!shouldLock && isLocked) {
+      entry.panel = entry.__decklockerOriginalPanel;
+      entry.__decklockerTabLocked = false;
+    }
+  }
+}
+
+// Real-time tracking of when any dialog/dropdown last opened anywhere in the app —
+// independent of the QAM's own render cycle. Confirmed by precise-timestamp testing
+// that Steam's QAM component only re-renders (and reports itself closed) *after* such
+// a dialog has already fully opened and closed, so checking DOM/state at that render is
+// always too late — ruled out CSS-class DOM matching (Steam's classes are mostly
+// per-build hashes, not semantic), polling window.FocusNavController (changes, but not
+// correlated with the actual interaction's timing), and patching @decky/ui's own
+// showContextMenu export directly (a frozen, non-configurable webpack getter).
+//
+// Documented in decky-frontend-lib's source (SteamDeckHomebrew/decky-frontend-lib,
+// src/components/Menu.ts) as a thin wrapper around Steam's own
+// GetContextMenuManagerFromWindow().CreateContextMenuInstance() — a real Steam Client
+// method, not a guessed CSS class, and the function backing the Dropdown component most
+// plugins use for exactly this kind of "dropdown button that shows a menu" UI. Since
+// GetContextMenuManagerFromWindow's own name is minified (unlike showContextMenu's) and
+// can't be found by name, the manager is instead obtained by calling showContextMenu
+// once ourselves (hidden, harmless) and reading it off the returned instance's own
+// m_ContextMenuManager field (confirmed present by direct testing) — then patching
+// CreateContextMenuInstance on that (singleton) manager object catches every plugin's
+// own showContextMenu call regardless of load order, since showContextMenu re-fetches
+// the manager fresh on every call rather than caching it.
+let lastOverlayActivityAt = 0;
+let overlayActivityWatcherStarted = false;
+
+// Marks activity and wraps the returned ContextMenuInstance's Hide() so the grace
+// window also extends through however long the menu stays open, not just its opening.
+function markContextMenuOpened(ret: any) {
+  lastOverlayActivityAt = Date.now();
+  try {
+    const origHide = ret?.Hide;
+    if (typeof origHide === "function" && !ret.__decklockerHidePatched) {
+      ret.__decklockerHidePatched = true;
+      ret.Hide = function (this: any, ...hideArgs: any[]) {
+        lastOverlayActivityAt = Date.now();
+        return origHide.apply(this, hideArgs);
+      };
+    }
+  } catch (e) {
+    console.error("DeckLocker: failed to patch ContextMenuInstance.Hide", e);
+  }
+}
+
+// Patches CreateContextMenuInstance directly on a manager instance (a regular runtime
+// object, not a frozen webpack module export) so it catches every caller — including
+// other plugins' own bundled copies of showContextMenu — regardless of load order,
+// since showContextMenu's own code re-fetches the manager fresh on every call.
+function patchContextMenuManagerOnce(mgr: any) {
+  if (!mgr || mgr.__decklockerPatched || typeof mgr.CreateContextMenuInstance !== "function") return;
+  mgr.__decklockerPatched = true;
+  const origCreate = mgr.CreateContextMenuInstance;
+  mgr.CreateContextMenuInstance = function (this: any, ...args: any[]) {
+    const ret = origCreate.apply(this, args);
+    markContextMenuOpened(ret);
+    return ret;
+  };
+}
+
+function ensureOverlayActivityWatcher() {
+  if (overlayActivityWatcherStarted) return;
+  overlayActivityWatcherStarted = true;
+  try {
+    // showContextMenu's own export is a frozen (non-configurable) webpack getter —
+    // confirmed by testing ("Cannot redefine property"), so it can't be wrapped
+    // directly, and GetContextMenuManagerFromWindow's name turned out to be minified
+    // (unlike showContextMenu's), so it can't be found by name either. Instead, make
+    // one harmless, hidden showContextMenu call ourselves and read the manager off the
+    // returned instance's own m_ContextMenuManager field — confirmed present by
+    // direct testing — then patch CreateContextMenuInstance on that (singleton)
+    // manager object, which every plugin's own showContextMenu call goes through
+    // regardless of load order, since showContextMenu re-fetches it fresh each call.
+    const probeInstance: any = showContextMenu("" as any, undefined, { bCreateHidden: true });
+    const mgr = probeInstance?.m_ContextMenuManager;
+    probeInstance?.Hide?.();
+    if (!mgr) {
+      console.error("DeckLocker: probe instance had no m_ContextMenuManager field");
+      return;
+    }
+    patchContextMenuManagerOnce(mgr);
+  } catch (e) {
+    console.error("DeckLocker: failed to start overlay activity watcher", e);
+  }
+}
+
+const OVERLAY_GRACE_MS = 4000;
+function recentOverlayActivity(): boolean {
+  return Date.now() - lastOverlayActivityAt < OVERLAY_GRACE_MS;
+}
+
+// Labels exactly as Steam renders them in the Main Menu (opened via the ● STEAM
+// button) — confirmed by live-patching MainMenuBrowserView/MainMenuEmbedded and
+// inspecting its actual rendered item list. "Home" and "Friends & Chat" also appear in
+// that list but weren't requested, so they're left alone. Of these six, "Power" is
+// built as a plain action-only item (no route at all); the rest navigate to a route
+// via the module's exported route-item builder — the two need different interception
+// points below (patchMainMenuRouteItems vs. the item-list wrapper in
+// getMainMenuItemsGate).
+const MAIN_MENU_LOCKABLE_ITEMS = ["Library", "Store", "Media", "Downloads", "Settings", "Power"];
+function mainMenuItemLockKey(label: string): string {
+  return `mainmenu:${label}`;
+}
+
+// Shared "is this Main Menu item currently locked" check — used both for the Main
+// Menu's own item list (below) and for guarding the Library route directly (see
+// patchLibraryRouteLock), since Home's own "View more in your Library" shortcut tile
+// reaches that same destination without ever going through the Main Menu's list at all.
+function isMainMenuItemLocked(label: string): boolean {
+  return !!cachedSettings?.locked_main_menu_items?.includes(label) && !unlockedPluginsThisSession.has(mainMenuItemLockKey(label));
+}
+
+// Main Menu items share the same "unlock once, re-lock when the container closes"
+// model as QAM tabs/plugins (unlockedPluginsThisSession, namespaced), just re-armed on
+// the Main Menu's own open/close transition instead of the QAM's.
+function rearmMainMenuLocks() {
+  const names = Array.from(unlockedPluginsThisSession).filter((k) => k.startsWith("mainmenu:"));
+  if (names.length === 0) return;
+  names.forEach((k) => unlockedPluginsThisSession.delete(k));
+  names.forEach(notifyPluginLockChange);
+}
+
+// Cached count of real items in the Main Menu's list (Home, Library, Store, Friends &
+// Chat, Media, Downloads, Settings, Power — updated on every render of the item-list
+// gate wrapper below), used only to pad MainMenuPinModalContent with matching "ghost"
+// rows so its content block ends up the same total height as the real list — the real
+// list centers its children as a whole block, so a shorter PIN prompt alone would land
+// noticeably higher than the real list's first item does.
+let knownMainMenuItemCount = 0;
+
+// The actual modal content — DeckyPanelPinPrompt plus invisible ghost rows (see
+// knownMainMenuItemCount) so the visible content centers the same way the real list
+// does, in the same visual shell measured off the real list ("g"): pure black
+// background, flush left/right but inset ~40px top/bottom (the "status bar" allowance),
+// right-side-only rounded corners, ~241px wide to match the real panel.
+//
+// Wires both the title-bar Back button and the controller B button (Focusable's
+// onCancel) to the same dismiss path. Also listens for the render surface's own window
+// losing OS focus as a fallback dismiss path — live testing found this actually renders
+// inline inside Big Picture Mode's own document rather than a separate native window
+// (see openMainMenuPinModal below), so this listener is a no-op there; outside-click
+// dismissal in that (confirmed, current) case is instead handled by the full-size
+// click-catcher div rendered below. Left in place in case a future Steam Client build
+// pops this out into a real separate window after all, per showModal's own internal
+// logic (module 13869 in Steam's own webpack bundle) choosing between the two.
+function MainMenuPinModalContent({
+  label,
+  onDismiss,
+  onUnlocked,
+}: {
+  label: string;
+  onDismiss: () => void;
+  onUnlocked: () => void;
+}) {
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const [rowHeightPx, setRowHeightPx] = useState(0);
+  useEffect(() => {
+    const btn = wrapperRef.current?.querySelector('[role="button"]') as HTMLElement | null;
+    if (btn) setRowHeightPx(btn.getBoundingClientRect().height);
+  }, []);
+
+  useEffect(() => {
+    // Our own component code executes in SharedJSContext's JS realm regardless of
+    // which document its DOM actually renders into — confirmed earlier for the Main
+    // Menu's own document/focus quirks — so the bare global `window` here is
+    // SharedJSContext's, not the render surface's, and would never blur on an outside
+    // click there. wrapperRef's real DOM node's ownerDocument.defaultView is correct
+    // whichever surface this actually rendered into.
+    const popupWindow = wrapperRef.current?.ownerDocument?.defaultView;
+    if (!popupWindow) return;
+    const onBlur = () => onDismiss();
+    popupWindow.addEventListener("blur", onBlur);
+    return () => popupWindow.removeEventListener("blur", onBlur);
+  }, [onDismiss]);
+
+  // Steam's own dialog layout always reserves footer height at the bottom of the modal
+  // area, even when the on-screen keyboard is up and has already taken over that same
+  // area — measured live: with the keyboard open, the modal's own container stops a
+  // full footer-height short of where the keyboard actually starts, leaving that
+  // reserved (but now pointless, since the keyboard already covers it) footer band as a
+  // visible gap between our panel and the keyboard. Detected via the keyboard's own DOM
+  // node's real height (there's no exposed prop for this), so the panel's bottom edge
+  // can be pinned to exactly where the keyboard actually starts (not just flush to the
+  // literal screen bottom, which would extend the panel behind the keyboard instead of
+  // shrinking to meet it) — and left alone (0) the rest of the time, keeping the
+  // already-correct (footer visible, no gap) layout.
+  // Polled rather than driven off a MutationObserver: the keyboard slides in with its
+  // own transition, so the DOM mutation announcing its presence fires well before it
+  // reaches its final height — a MutationObserver-only check kept measuring that first,
+  // mid-animation (often ~0) sample and then never fired again (transitions don't
+  // themselves re-trigger attribute-value mutations), so the panel only actually
+  // resized whenever some UNRELATED mutation happened to occur later (e.g. moving the
+  // on-screen keyboard's own key selection). Polling sidesteps needing to know when the
+  // animation actually finishes at all.
+  const [keyboardHeightPx, setKeyboardHeightPx] = useState(0);
+  useEffect(() => {
+    const doc = wrapperRef.current?.ownerDocument;
+    if (!doc) return;
+    const interval = doc.defaultView?.setInterval(() => {
+      const kb = doc.getElementById("virtual keyboard");
+      setKeyboardHeightPx(kb ? kb.getBoundingClientRect().height : 0);
+    }, 100);
+    return () => {
+      if (interval) doc.defaultView?.clearInterval(interval);
+    };
+  }, []);
+
+  const ghostCount = Math.max(0, knownMainMenuItemCount - 4 + 2); // 4 = title, "Enter PIN", field, Unlock; +2 extra ghost gaps
+  const ghostHeightPx = rowHeightPx * 1.3;
+
+  return (
+    // Live DOM inspection showed this content is NOT actually popped out into its own
+    // native window (despite bForcePopOut) — it renders inline inside Steam Big Picture
+    // Mode's own document, inside a wrapper (#ModalDialogOverlay_Modal_2) that Steam
+    // sizes to the FULL screen width even though our own visible panel is only 241px
+    // wide. The "empty" area beside our panel is still inside that wrapper's own hit
+    // area (not Steam's separate dismiss-on-click backdrop behind it, which never
+    // receives the click), so nothing dismissed on a click there. This full-size div
+    // fills that same space itself and handles the click directly; the actual panel
+    // stops the click from bubbling back up to it.
+    <div
+      style={
+        keyboardHeightPx > 0
+          ? {
+              position: "fixed",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: `${keyboardHeightPx}px`,
+              transition: "bottom 0.15s ease-out",
+            }
+          : { width: "100%", height: "100%" }
+      }
+      onClick={onDismiss}
+    >
+      <Focusable
+        ref={wrapperRef}
+        flow-children="vertical"
+        onCancel={onDismiss}
+        onClick={(e: any) => e.stopPropagation()}
+        style={
+          keyboardHeightPx > 0
+            ? // Break out of the modal's own (too-short) reserved height entirely —
+              // pinned to exactly where the keyboard itself starts (not just flush to
+              // the literal screen bottom, which would extend the panel behind the
+              // keyboard instead of shrinking to meet it), closing the reserved-but-
+              // now-pointless footer gap that would otherwise sit between them.
+              {
+                width: "241px",
+                position: "fixed",
+                top: "40px",
+                left: 0,
+                bottom: `${keyboardHeightPx}px`,
+                boxSizing: "border-box",
+                transition: "bottom 0.15s ease-out",
+              }
+            : {
+                width: "241px",
+                height: "100%",
+                // Padding, not margin: measured live that a top *margin* on the black
+                // box below collapses straight through this Focusable (neither has its
+                // own padding/border to stop it), which pushes Focusable's own rendered
+                // box down 40px without shrinking it — so it silently overflows past
+                // its container's real bottom edge by that same 40px, while the black
+                // box's own "calc(100% - 40px)" height then subtracts *another* 40px
+                // expecting that space to still be inside it, landing 40px short of the
+                // actual bottom. Padding isn't subject to collapsing, so with
+                // boxSizing: border-box the black box can just be height: "100%" of
+                // Focusable's own (correctly contained) content box, no gap either end.
+                boxSizing: "border-box",
+                paddingTop: "40px",
+              }
+        }
+      >
+        <style>{`
+          @keyframes decklocker-mainmenu-slide-in {
+            0% { transform: translateX(24px); opacity: 0; }
+            100% { transform: translateX(0); opacity: 1; }
+          }
+          /* Steam's own modal backdrop applies a backdrop-filter blur behind every
+             dialog (confirmed live: .ModalOverlayBackground computed backdropFilter is
+             "blur(3px)", background already transparent on its own) — scoped to this
+             component's own mounted lifetime via this <style> tag, rather than a global
+             override, so it doesn't affect any other dialog shown while this isn't. */
+          .ModalOverlayBackground {
+            backdrop-filter: none !important;
+          }
+        `}</style>
+        <div
+          style={{
+            background: "rgb(0, 0, 0)",
+            width: "100%",
+            height: "100%",
+            paddingTop: "16px",
+            borderRadius: "0px 16px 16px 0px",
+            boxSizing: "border-box",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "center",
+            animation: "decklocker-mainmenu-slide-in 0.25s ease-out",
+          }}
+        >
+          <DeckyPanelPinPrompt title={label} plainTitle onBack={onDismiss} onUnlocked={onUnlocked} />
+          {rowHeightPx > 0 &&
+            Array.from({ length: ghostCount }).map((_, i) => (
+              <div key={i} style={{ height: `${ghostHeightPx}px`, visibility: "hidden" }} />
+            ))}
+        </div>
+      </Focusable>
+    </div>
+  );
+}
+
+// The PIN gate shown for a locked Main Menu item, via showModal (with bForcePopOut)
+// rather than substituted in place of the item list.
+//
+// Why: the Main Menu's own list container ("g") lives in a genuinely different native
+// popup window (MainMenu_uid2) from the one Steam's on-screen keyboard actually renders
+// into (the base "Steam Big Picture Mode" window) — confirmed by live DOM inspection of
+// both while the keyboard was shown. MainMenu_uid2 is always composited *above* that
+// base window (by design — it's the system menu opened by the physical STEAM button), so
+// any content substituted inside it can never show the keyboard on top, no matter its
+// CSS — the keyboard is drawn as a full-width band in a *different, lower* native
+// window. QAM's own text fields don't have this problem only because QuickAccess_uid2
+// happens to be composited *below* the base window instead (confirmed: same keyboard
+// DOM, same rect, opposite visual stacking) — not because of anything different in QAM's
+// React tree. Since a plugin can't change MainMenu_uid2's native window level, the fix
+// is to stop rendering the PIN prompt inside it at all: showModal renders this content
+// somewhere else entirely — confirmed live to actually be inline inside Big Picture
+// Mode's own document on this Steam Client build (not a genuinely separate popup, despite
+// bForcePopOut — see MainMenuPinModalContent), which happens to be exactly the window the
+// keyboard already renders into, so the keyboard now shows correctly on top as a side
+// effect. Back-button/outside-click dismissal are wired explicitly (see
+// MainMenuPinModalContent) since neither comes for free in that inline case.
+function openMainMenuPinModal(label: string, runOriginalAction: () => void) {
+  let modal: { Close: () => void; Update: (n: ReactNode) => void };
+  modal = showModal(
+    <MainMenuPinModalContent
+      label={label}
+      onDismiss={() => modal.Close()}
+      onUnlocked={() => {
+        unlockedPluginsThisSession.add(mainMenuItemLockKey(label));
+        modal.Close();
+        runOriginalAction();
+      }}
+    />,
+    window,
+    { bForcePopOut: true, popupWidth: 241, popupHeight: 599 }
+  );
+}
+
+// Whether a route path is "the Library section" for the purposes of the Main Menu's
+// Library lock — i.e. the actual browse-all-games destination, not the Home screen
+// (which — confirmed live — is itself routed at /library/home, so a naive "starts with
+// /library" match would wrongly gate Home too) and not individual game pages
+// (/library/app/:appid, already separately gated by patchAppPage/LockedPageGate using
+// the per-app locked_apps list, not this one).
+function isLibraryBrowseRoute(pathname: string): boolean {
+  // window.location.pathname carries a "/routes" prefix ahead of the route path used
+  // everywhere else in this file (confirmed live: the Home screen's own pathname is
+  // "/routes/library/home", not "/library/home") — easy to miss since routerHook's own
+  // patch paths (e.g. "/library/app/:appid" above) are given without it.
+  return (
+    pathname === "/routes/library" ||
+    pathname.startsWith("/routes/library/tab/") ||
+    pathname.startsWith("/routes/library/collection/")
+  );
+}
+
+// Full-screen keypad lock screen for someone who reached the Library route some other
+// way than the Main Menu's own "Library" item (see startLibraryRouteLockWatcher below)
+// — the same PinLockScreen used for individual games, in libraryMode since there's no
+// real app behind this one (no art to load, and PIN success/cancel shouldn't touch
+// unlockedThisSession/terminateAppAggressively, both meant for actual running games).
+// PinLockScreen's own onCancel already navigates back on dismiss, so simply closing the
+// modal never leaves the real (unlocked-looking, though still not interactive without
+// this gate) Library page sitting there underneath.
+function openLibraryRouteLockModal() {
+  let modal: { Close: () => void; Update: (n: ReactNode) => void };
+  modal = showModal(
+    <PinLockScreen
+      appid="library"
+      appName="Library"
+      libraryMode
+      closeModal={() => modal.Close()}
+      onUnlocked={() => unlockedPluginsThisSession.add(mainMenuItemLockKey("Library"))}
+    />
+  );
+}
+
+// Home's own "View more in your Library" shortcut tile (and potentially other future
+// bypasses) reaches the Library route directly through its own onClick prop, without
+// ever going through the Main Menu's own patched item list at all — confirmed live that
+// a capture-phase DOM click listener never even sees gamepad Activate on that tile
+// (nothing in the DOM event system fires for it), and patching the Library route's own
+// top-level component tree crashed the app outright (a class component's own render
+// method got replaced with a non-class-calling-convention wrapper — minified React
+// error #130). Polling the current route instead avoids touching Library's own
+// component tree entirely: whenever it becomes the Library section while locked, this
+// shows the same PIN gate over it and backs out on cancel, using only the same
+// supported Navigation API any plugin can call.
+function startLibraryRouteLockWatcher(): () => void {
+  let lastGatedPath = "";
+  const check = () => {
+    const pathname = window.location.pathname;
+    if (!isLibraryBrowseRoute(pathname)) {
+      lastGatedPath = "";
+      return;
+    }
+    if (pathname === lastGatedPath) return;
+    if (!isMainMenuItemLocked("Library")) return;
+    lastGatedPath = pathname;
+    openLibraryRouteLockModal();
+  };
+  check();
+  const interval = setInterval(check, 300);
+  return () => clearInterval(interval);
+}
+
+// Recursively searches a React element tree (via .props.children, handling arrays) for
+// the first element whose props contain every key in `requiredKeys` — used to find the
+// Main Menu's inner components structurally (by the distinctive prop shape they carry,
+// e.g. {bLoggedIn, popup} or {loggedIn, menuOpen}) rather than by their minified
+// function name, which is build-specific and not something to depend on long-term.
+function findElementByProps(el: any, requiredKeys: string[]): any {
+  if (el == null || typeof el !== "object") return null;
+  if (Array.isArray(el)) {
+    for (const c of el) {
+      const found = findElementByProps(c, requiredKeys);
+      if (found) return found;
+    }
+    return null;
+  }
+  if ("type" in el) {
+    const props = el.props;
+    if (props && typeof props === "object" && requiredKeys.every((k) => k in props)) return el;
+    if (props?.children !== undefined) {
+      const found = findElementByProps(props.children, requiredKeys);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// Recursively searches a React element tree for every element whose `label` prop is in
+// `labels`, calling `visit` on each. Used to find action-only locked items (Power) that
+// never pass through the route-item builder patchMainMenuRouteItems intercepts, since
+// they're built directly with a plain `action` function and no `route` at all.
+function forEachElementWithLabel(el: any, labels: Set<string>, visit: (el: any) => void) {
+  if (el == null || typeof el !== "object") return;
+  if (Array.isArray(el)) {
+    for (const c of el) forEachElementWithLabel(c, labels, visit);
+    return;
+  }
+  if ("type" in el) {
+    const label = el.props?.label;
+    if (typeof label === "string" && labels.has(label)) visit(el);
+    if (el.props?.children !== undefined) forEachElementWithLabel(el.props.children, labels, visit);
+  }
+}
+
+// Wraps the Main Menu's item-list component (an unexported local component, reached
+// only via the element tree — see patchMainMenuLock below) so it can intercept locked
+// items' actions and route them through openMainMenuPinModal instead. Cached per
+// original component reference (not recreated per render) so React sees a STABLE
+// function identity across renders — a fresh function object would otherwise look like
+// a brand new component type to React each time, remounting the real item list.
+//
+// Not a component with hooks of its own — just a plain wrapper called with the same
+// args React would pass to OriginalItemList (mirroring getWrappedRouteItemType below),
+// since there's no longer any local state to hold: the PIN gate is now a showModal
+// pop-out (see openMainMenuPinModal) rather than something substituted into this
+// component's own render output, so nothing here needs to react to menuOpen/pendingLabel
+// transitions or worry about hook-call-count consistency across renders.
+const mainMenuItemsGateCache = new WeakMap<Function, Function>();
+function getMainMenuItemsGate(OriginalItemList: Function): Function {
+  const cached = mainMenuItemsGateCache.get(OriginalItemList);
+  if (cached) return cached;
+
+  const GateComponent = function (this: any, ...args: any[]) {
+    const innerRet = OriginalItemList.apply(this, args);
+
+    // Read directly off the real list's own element tree (its children are
+    // [itemsArray, trailingDiv] per live inspection) rather than a DOM query, for
+    // MainMenuPinModalContent's ghost rows to consume later.
+    const listChildren = innerRet?.props?.children;
+    const items = Array.isArray(listChildren) ? listChildren[0] : null;
+    if (Array.isArray(items) && items.length > 0) {
+      knownMainMenuItemCount = items.length;
+    }
+
+    const lockedNames = new Set((cachedSettings?.locked_main_menu_items ?? []).filter(isMainMenuItemLocked));
+    if (lockedNames.size > 0) {
+      forEachElementWithLabel(innerRet, lockedNames, (itemEl) => {
+        if (typeof itemEl.props?.action === "function") {
+          // Action-only item (Power): the action is already computed, so it can be
+          // wrapped directly.
+          const label = itemEl.props.label;
+          const originalAction = itemEl.props.action;
+          itemEl.props.action = () => {
+            try {
+              openMainMenuPinModal(label, originalAction);
+            } catch (e) {
+              console.error("DeckLocker: action item gate trigger threw", e);
+            }
+          };
+        } else if (typeof itemEl.type === "function") {
+          // Route item (Library/Store/Media/Downloads/Settings): its action isn't
+          // computed until it renders, so wrap the component itself instead.
+          itemEl.type = getWrappedRouteItemType(itemEl.type);
+        }
+      });
+    }
+
+    return innerRet;
+  };
+
+  mainMenuItemsGateCache.set(OriginalItemList, GateComponent);
+  return GateComponent;
+}
+
+// Wraps a route item's own component (e.g. the unexported "Ae" that renders Library/
+// Store/Media/Downloads/Settings) in place, the same way getMainMenuItemsGate wraps the
+// item-list component itself — needed because, unlike Power (built directly as a plain
+// action item), a route item's `action` isn't computed until this component actually
+// renders (internally calling the module's route-item builder, e.g. "pe"), so it can't
+// be intercepted from the outside by mutating a prop the way Power's is.
+//
+// Patching the route-item BUILDER directly (module export "AX"/pe) was the first
+// approach tried, but webpack defines every named export as a getter-only accessor —
+// `afterPatch(mod, "AX", ...)` throws "Cannot set property AX of #<Object> which has
+// only a getter" — and even if that succeeded, the component calls the builder via its
+// own internal closure, not through the module's exports object, so patching the export
+// wouldn't reach that call anyway (the same reason showContextMenu's own export
+// couldn't be patched directly — see ensureOverlayActivityWatcher above). Wrapping the
+// element's `.type` sidesteps both problems entirely, mirroring the `.type` mutation
+// already proven to work for Ie and for QAM's own already-mounted-fiber fixup.
+//
+// One shared component (e.g. "Ae") renders every route item, just with different props
+// per item (route/label/icon), so the wrapper can't bake in a specific label at wrap
+// time — it has to read `args[0].label` fresh on every call and check the CURRENT lock
+// state itself, the same way getMainMenuItemsGate's Power-item check does.
+const mainMenuRouteItemWrapperCache = new WeakMap<Function, Function>();
+function getWrappedRouteItemType(OriginalRouteItem: Function): Function {
+  const cached = mainMenuRouteItemWrapperCache.get(OriginalRouteItem);
+  if (cached) return cached;
+
+  const Wrapped = function (this: any, ...args: any[]) {
+    const meElement = OriginalRouteItem.apply(this, args);
+    const label = args?.[0]?.label;
+    const locked = typeof label === "string" && isMainMenuItemLocked(label);
+    if (
+      locked &&
+      meElement &&
+      typeof meElement === "object" &&
+      typeof meElement.props?.action === "function"
+    ) {
+      const originalAction = meElement.props.action;
+      meElement.props.action = () => {
+        try {
+          openMainMenuPinModal(label, originalAction);
+        } catch (e) {
+          console.error("DeckLocker: route item gate trigger threw", e);
+        }
+      };
+    }
+    return meElement;
+  };
+
+  mainMenuRouteItemWrapperCache.set(OriginalRouteItem, Wrapped);
+  return Wrapped;
+}
+
+// Finds Steam's own Main Menu (opened via the ● STEAM button, as opposed to the •••
+// QAM button patched by patchQamDeckyTabLock below), and wraps its item list so a
+// locked item (Library/Store/Media/Downloads/Settings/Power) opens the PIN gate as a
+// showModal pop-out (see openMainMenuPinModal) instead of running its normal action.
+//
+// Found via the same "search a real console.log tag back to its owning module, then
+// content-match the actual component" process used for the QAM tab strip: the STEAM
+// button's gamepad handler logs `onGlobalMenuButtonDown` then calls
+// `e.OnHomeButtonPressed()` (the QAM button's equivalent calls
+// `e.OnQuickAccessButtonPressed()`), which — confirmed by live-patching and inspecting
+// what actually renders — leads to two React.memo-wrapped components, MainMenuBrowserView
+// and MainMenuEmbedded, both rendering a shared inner component reliably anchored by its
+// distinctive {bLoggedIn, popup} props (mirroring patchQamDeckyTabLock's own
+// onFocusNavDeactivated anchor). That inner component renders exactly one child, the
+// item-list component (found here by its own distinctive {loggedIn, menuOpen} props),
+// which is where the actual Library/Store/Media/Downloads/Settings/Power items live.
+function patchMainMenuLock(): { unregister: () => void } {
+  let wasMenuOpen = false;
+  let pendingDialogInducedClose = false;
+  let latestMenuOpen = false;
+  let recheckTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleRecheck = () => {
+    if (recheckTimer) clearTimeout(recheckTimer);
+    recheckTimer = setTimeout(() => {
+      recheckTimer = null;
+      if (latestMenuOpen) {
+        pendingDialogInducedClose = false;
+        return;
+      }
+      if (recentOverlayActivity()) {
+        scheduleRecheck();
+        return;
+      }
+      rearmMainMenuLocks();
+      pendingDialogInducedClose = false;
+    }, OVERLAY_GRACE_MS);
+  };
+
+  ensureOverlayActivityWatcher();
+
+  let attempts = 0;
+  const maxAttempts = 15; // 30s of retries in case the module isn't loaded yet
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  const tryPatch = (): boolean => {
+    try {
+      const mainMenuModule = findModuleByExport((e: any) => e?.type?.toString?.()?.includes("MainMenuBrowserView"));
+      if (!mainMenuModule) return false;
+
+      const renderers = [
+        Object.values(mainMenuModule).find((e: any) => e?.type?.toString?.()?.includes("MainMenuBrowserView")),
+        Object.values(mainMenuModule).find((e: any) => e?.type?.toString?.()?.includes("MainMenuEmbedded")),
+      ].filter(Boolean) as any[];
+      if (renderers.length === 0) return false;
+
+      const handler = createReactTreePatcher(
+        [
+          (tree: any) =>
+            findInReactTree(tree, (node: any) => {
+              const p = node?.props;
+              return !!p && typeof p === "object" && "bLoggedIn" in p && "popup" in p;
+            }),
+        ],
+        (args: any, ret: any) => {
+          const menuOpen = !!args?.[0]?.open;
+          latestMenuOpen = menuOpen;
+
+          if (!menuOpen && wasMenuOpen) {
+            if (recentOverlayActivity()) {
+              pendingDialogInducedClose = true;
+              scheduleRecheck();
+            } else {
+              rearmMainMenuLocks();
+              pendingDialogInducedClose = false;
+            }
+          } else if (menuOpen && pendingDialogInducedClose) {
+            pendingDialogInducedClose = false;
+            if (recheckTimer) {
+              clearTimeout(recheckTimer);
+              recheckTimer = null;
+            }
+          }
+          wasMenuOpen = menuOpen;
+
+          const itemListElement = findElementByProps(ret, ["loggedIn", "menuOpen"]);
+          if (itemListElement && typeof itemListElement.type === "function") {
+            itemListElement.type = getMainMenuItemsGate(itemListElement.type);
+          }
+
+          return ret;
+        },
+        "DeckLockerMainMenuLock"
+      );
+
+      for (const renderer of renderers) {
+        afterPatch(renderer, "type", handler);
+      }
+
+      // Mirrors patchQamDeckyTabLock's own already-mounted-fiber fixup: the Main Menu's
+      // components are mounted once at startup and kept alive (just hidden) rather than
+      // remounted each time it opens, so patching the module export's `.type` alone
+      // never reaches the already-existing fiber.
+      const root = getReactRoot(document.getElementById("root") as any);
+      if (root) {
+        for (const renderer of renderers) {
+          const existingNode = findInReactTree(root, (n: any) => n?.elementType === renderer);
+          if (existingNode) {
+            existingNode.type = existingNode.elementType.type;
+            if (existingNode.alternate) existingNode.alternate.type = existingNode.type;
+          }
+        }
+      } else {
+        console.warn("DeckLocker: getReactRoot found nothing; could not patch already-mounted Main Menu node");
+      }
+
+      return true;
+    } catch (e) {
+      console.error("DeckLocker: failed to patch Main Menu item locks", e);
+      return false;
+    }
+  };
+
+  const search = () => {
+    attempts++;
+    if (tryPatch() || attempts >= maxAttempts) {
+      if (timer) clearInterval(timer);
+    }
+  };
+  timer = setInterval(search, 2000);
+  search();
+
+  return {
+    unregister: () => {
+      if (timer) clearInterval(timer);
+      if (recheckTimer) clearTimeout(recheckTimer);
+    },
+  };
+}
+
+// Finds Steam's own QAM tab-strip renderer, tracks whether Decky's own tab (the plug
+// icon) is the currently active tab, and substitutes the Decky tab's own panel content
+// with DeckyTabGate the first time it's seen — so the PIN gate can render inside the
+// QAM's own tree, in place of the plugin list, rather than as a separate overlay.
+//
+// Mirrors the technique Decky Loader's own TabsHook uses internally to find the QAM
+// renderer (frontend/src/tabs-hook.tsx in SteamDeckHomebrew/decky-loader) and to
+// substitute tab panels (its own `render()` method does the same kind of in-place
+// mutation to install each plugin's panel in the first place). Also reads the
+// `activeTab` prop Valve's tab-strip component receives as a sibling of `tabs`,
+// confirmed by reading Steam's own (de-minified) UI source. This reaches into
+// undocumented internals, so it can break on a future Steam Client update; if the hook
+// can't be installed, the panel lock simply fails to activate rather than throwing.
+function patchQamDeckyTabLock(): { unregister: () => void } {
+  const patches: any[] = [];
+  let wasQamOpen = false;
+  let wasDeckyTabActive = false;
+  let loggedMissingOpenProp = false;
+  // Tracks the pattern: QAM closes WHILE a dialog/dropdown is open (a false close signal
+  // — the QAM only looks closed because the dialog covers it) vs. a genuine close. Only
+  // re-arms once the QAM is seen still closed AFTER that dialog has also closed; if the
+  // QAM instead reports open again first, the earlier close was confirmed bogus.
+  let pendingDialogInducedClose = false;
+
+  const rearmLocks = () => {
+    if (cachedSettings?.decky_panel_lock_enabled) {
+      deckyQamLocked = true;
+    }
+    // Reset so reopening directly onto the Decky tab (if it was already selected when
+    // the QAM closed) is treated as a fresh "became active" transition below, instead
+    // of a no-op continuation of the state from before closing.
+    wasDeckyTabActive = false;
+    // Individual plugin locks re-lock on every QAM close, unlike Lock This Plugin's
+    // persist-until-sleep model.
+    if (unlockedPluginsThisSession.size > 0) {
+      const names = Array.from(unlockedPluginsThisSession);
+      unlockedPluginsThisSession.clear();
+      names.forEach(notifyPluginLockChange);
+    }
+  };
+
+  // Updated on every render regardless of anything else, so the recheck timer below
+  // (which runs outside React's render cycle) can consult the latest known value.
+  let latestQamOpen = false;
+  let recheckTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleRecheck = () => {
+    if (recheckTimer) clearTimeout(recheckTimer);
+    recheckTimer = setTimeout(() => {
+      recheckTimer = null;
+      if (latestQamOpen) {
+        pendingDialogInducedClose = false;
+        return;
+      }
+      if (recentOverlayActivity()) {
+        scheduleRecheck();
+        return;
+      }
+      rearmLocks();
+      pendingDialogInducedClose = false;
+    }, OVERLAY_GRACE_MS);
+  };
+
+  ensureOverlayActivityWatcher();
+
+  try {
+    const qamModule = findModuleByExport((e: any) => e?.type?.toString?.()?.includes("QuickAccessMenuBrowserView"));
+    const renderers = [
+      Object.values(qamModule ?? {}).find((e: any) => e?.type?.toString?.()?.includes("QuickAccessMenuBrowserView")),
+      Object.values(qamModule ?? {}).find((e: any) => e?.type?.toString?.()?.includes("QuickAccessMenuEmbedded")),
+    ].filter(Boolean);
+
+    const handler = createReactTreePatcher(
+      [(tree: any) => findInReactTree(tree, (node: any) => node?.props?.onFocusNavDeactivated)],
+      (args: any, ret: any) => {
+        const tabsNode = findInReactTree(ret, (x: any) => x?.props?.tabs && "activeTab" in x.props);
+        if (!tabsNode) {
+          console.warn("DeckLocker: could not locate QAM active-tab prop this render");
+          return ret;
+        }
+
+        const deckyTabEntry = tabsNode.props.tabs?.find((t: any) => t?.key === QuickAccessTab.Decky);
+        if (deckyTabEntry && !deckyTabEntry.__decklockerWrapped) {
+          deckyTabEntry.__decklockerWrapped = true;
+          const originalPanel = deckyTabEntry.panel;
+          deckyTabEntry.panel = <DeckyTabGate>{originalPanel}</DeckyTabGate>;
+        }
+        applyBuiltinTabLocks(tabsNode.props.tabs);
+
+        // The QAM's own overall open/closed state (as opposed to which tab is active
+        // within it) — field name observed as `active` on some Steam Client builds,
+        // `visible` on others, so check both.
+        if (!loggedMissingOpenProp && args?.[0]?.active === undefined && args?.[0]?.visible === undefined) {
+          loggedMissingOpenProp = true;
+          console.warn("DeckLocker: QAM open/closed prop not found on args[0]; keys:", args?.[0] && Object.keys(args[0]));
+        }
+        // `visible` is the reliable "is the QAM actually on screen" signal — confirmed
+        // by testing that it stays true the entire time a dropdown/dialog is open
+        // inside a plugin, while `active` can flip to false (losing focus to that
+        // dropdown) without the QAM itself closing. `visible` takes priority; `active`
+        // is only a fallback for whichever Steam Client builds don't have `visible`.
+        // (The previous `active ?? visible` was wrong for a different reason: `??`
+        // only falls through on null/undefined, not on `false`, so it never actually
+        // used `visible` at all once `active` was defined.)
+        const expanded = !!args?.[0]?.expanded;
+        const qamOpen = !!(args?.[0]?.visible ?? args?.[0]?.active) || expanded;
+        const deckyTabActive = tabsNode.props.activeTab === QuickAccessTab.Decky;
+        latestQamOpen = qamOpen;
+        const dialogRecentlyActive = recentOverlayActivity();
+
+        // Re-arm the gate only when the whole QAM closes — not merely switching to a
+        // different tab and back while it stays open, which should stay unlocked, and
+        // not when it "closes" only because a dialog/dropdown from within a plugin was
+        // recently open. Confirmed by precise-timestamp testing that the QAM's own
+        // render reporting "closed" happens *after* such a dialog has already fully
+        // opened and closed (they don't overlap in time), so this checks real-time
+        // overlay activity within a grace window instead of point-in-time DOM state.
+        if (!qamOpen && wasQamOpen) {
+          if (dialogRecentlyActive) {
+            pendingDialogInducedClose = true;
+            scheduleRecheck();
+          } else {
+            rearmLocks();
+            pendingDialogInducedClose = false;
+          }
+        } else if (qamOpen && pendingDialogInducedClose) {
+          pendingDialogInducedClose = false;
+          if (recheckTimer) {
+            clearTimeout(recheckTimer);
+            recheckTimer = null;
+          }
+        }
+
+        // Show the gate when the Decky tab becomes active, if still locked. Read
+        // cachedSettings synchronously (rather than awaiting getSettingsCached()) so
+        // deckyPanelGateVisible is already correct before React renders DeckyTabGate's
+        // initial/updated state in this same pass — an async round-trip here caused a
+        // visible flash of the unlocked plugin list before the gate caught up.
+        if (deckyTabActive && !wasDeckyTabActive) {
+          const s = cachedSettings;
+          if (s?.decky_panel_lock_enabled && s?.pin_set && deckyQamLocked) {
+            deckyPanelGateVisible = true;
+            notifyDeckyQamLockChange();
+          }
+          applyPluginLocks();
+        }
+
+        wasQamOpen = qamOpen;
+        wasDeckyTabActive = deckyTabActive;
+        return ret;
+      },
+      "DeckLockerQamTab"
+    );
+
+    for (const renderer of renderers) {
+      patches.push(afterPatch(renderer, "type", handler));
+    }
+
+    // The QAM tab-strip component is mounted once at startup and kept alive (just
+    // hidden) rather than remounted each time the QAM opens, so patching the module
+    // export's `.type` alone never reaches the already-existing fiber — it keeps calling
+    // its own original, unpatched function forever. Force the existing instance to pick
+    // up the patched version too; this is the same fix-up Decky Loader's own TabsHook
+    // applies, for the exact same reason, when it patches this same component.
+    const root = getReactRoot(document.getElementById("root") as any);
+    if (root) {
+      for (const renderer of renderers) {
+        const existingNode = findInReactTree(root, (n: any) => n?.elementType === renderer);
+        if (existingNode) {
+          existingNode.type = existingNode.elementType.type;
+          if (existingNode.alternate) {
+            existingNode.alternate.type = existingNode.type;
+          }
+        }
+      }
+    } else {
+      console.warn("DeckLocker: getReactRoot found nothing; could not patch already-mounted QAM node");
+    }
+  } catch (e) {
+    console.error("DeckLocker: failed to patch QAM tab strip", e);
+  }
+
+  if (!patches.length) {
+    console.error("DeckLocker: could not hook the QAM tab strip — Lock Decky Panel will not activate");
+  }
+
+  return {
+    unregister: () => {
+      if (recheckTimer) clearTimeout(recheckTimer);
+      patches.forEach((p) => p?.unpatch?.());
+    },
+  };
+}
+
+// ---- Locked Badges: a small lock icon overlaid on locked games' capsules in Home,
+// Recent, and the Library grid, so a locked game is recognizable without opening it. ----
+//
+// Reference implementation studied: decky-nonsteam-badges (installed at
+// ~/homebrew/plugins/decky-nonsteam-badges), which overlays store-icon badges on the
+// same native capsules using the same technique: rather than patching Steam's own React
+// tree (these grid/list capsules are virtualized and remounted constantly, making
+// individual-element patches fragile), find the real Big Picture document via a DOM
+// ref's ownerDocument, then directly scan for and inject plain DOM <div> badges into
+// game capsules, re-scanning on a MutationObserver plus a periodic fallback interval so
+// it keeps up with games scrolling in/out of virtualized lists. One difference: that
+// reference plugin locates the Big Picture window via window.DFL.getGamepadNavigationTrees(),
+// which returned an empty list when tested live on this Steam Client build — so instead
+// this reuses GlobalMenuWatcher's own already-working ref.current.ownerDocument (below),
+// the same real-document access pattern already proven for its focus/context-menu work.
+const LOCKED_BADGE_CLASSNAME = "decklocker-locked-badge";
+const LOCKED_BADGE_STYLE_ID = "decklocker-locked-badge-style";
+const LOCKED_BADGE_LOCK_SVG =
+  '<svg viewBox="0 0 448 512" width="65%" height="65%" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M144 144v48H304V144c0-44.2-35.8-80-80-80s-80 35.8-80 80zM80 192V144C80 64.5 144.5 0 224 0s144 64.5 144 144v48h16c35.3 0 64 28.7 64 64V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V256c0-35.3 28.7-64 64-64H80z"/></svg>';
+
+const LOCKED_BADGE_CSS = `
+.${LOCKED_BADGE_CLASSNAME} {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 4px;
+  box-sizing: border-box;
+  border-radius: 4px;
+  background: #0000008a;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  color: white;
+  pointer-events: none;
+  z-index: 50;
+}
+.${LOCKED_BADGE_CLASSNAME}.top-left { top: 4px; left: 4px; }
+.${LOCKED_BADGE_CLASSNAME}.top-right { top: 4px; right: 4px; }
+.${LOCKED_BADGE_CLASSNAME}.bottom-left { bottom: 4px; left: 4px; }
+.${LOCKED_BADGE_CLASSNAME}.bottom-right { bottom: 4px; right: 4px; }
+.${LOCKED_BADGE_CLASSNAME}.center { top: 50%; left: 50%; transform: translate(-50%, -50%); }
+`;
+
+function injectLockedBadgeStyle(doc: Document) {
+  if (doc.getElementById(LOCKED_BADGE_STYLE_ID)) return;
+  const style = doc.createElement("style");
+  style.id = LOCKED_BADGE_STYLE_ID;
+  style.textContent = LOCKED_BADGE_CSS;
+  doc.head.appendChild(style);
+}
+
+// Robust multi-fallback AppID extraction from a native Big Picture capsule element —
+// mirrors decky-nonsteam-badges' technique: React fiber props first (most reliable,
+// checked under several possible prop names since Steam's own internal naming isn't
+// consistent across capsule types), then a data-id attribute, then an anchor href,
+// since native capsules don't expose a plain data-appid attribute directly.
+function extractAppIdFromCapsule(capsule: Element): string | null {
+  try {
+    const elementsToCheck = [capsule, ...Array.from(capsule.querySelectorAll("*"))];
+    for (const el of elementsToCheck) {
+      const key = Object.keys(el).find(
+        (k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
+      );
+      if (!key) continue;
+      let fiber: any = (el as any)[key];
+      let depth = 0;
+      while (fiber && depth < 5) {
+        const props = fiber.memoizedProps || fiber.return?.memoizedProps;
+        if (props) {
+          const id =
+            props.appid ??
+            props.appId ??
+            props.unAppID ??
+            props.nAppID ??
+            props.m_unAppID ??
+            props.overview?.appid ??
+            props.appOverview?.appid ??
+            props.app?.unAppID ??
+            props.app?.nAppID ??
+            props.app?.appid ??
+            props.game?.appid ??
+            props.item?.appid;
+          if (id != null) return String(id);
+        }
+        fiber = fiber.return;
+        depth++;
+      }
+    }
+  } catch (e) {
+    // fall through to the DOM-based fallbacks below
+  }
+
+  const dataId = capsule.getAttribute("data-id");
+  if (dataId && !dataId.startsWith("placeholder")) return dataId;
+
+  const anchor = capsule.tagName.toLowerCase() === "a" ? capsule : capsule.querySelector("a");
+  const href = anchor?.getAttribute("href");
+  if (href) {
+    const match = href.match(/\/app\/(\d+)/i) || href.match(/\/details\/(\d+)/i) || href.match(/run\/(\d+)/i);
+    if (match) return match[1];
+  }
+
+  return null;
+}
+
+function isAppCurrentlyLocked(appid: string): boolean {
+  const s = cachedSettings;
+  return (
+    !!s?.global_lock_enabled &&
+    !!s?.locked_badge_enabled &&
+    s.locked_apps.includes(appid) &&
+    !unlockedThisSession.has(appid)
+  );
+}
+
+function applyLockedBadgeToCapsule(capsule: Element, doc: Document) {
+  const existing = capsule.querySelector(`.${LOCKED_BADGE_CLASSNAME}`);
+  const appid = extractAppIdFromCapsule(capsule);
+
+  if (!appid || !isAppCurrentlyLocked(appid)) {
+    existing?.remove();
+    return;
+  }
+
+  const role = capsule.getAttribute("role");
+  const img = capsule.querySelector("img");
+  let targetElement: HTMLElement;
+  if (role === "gridcell") {
+    // Library grid cells are rendered with style="display: contents" (confirmed live)
+    // — an element with that display value generates no box of its own, so
+    // position:relative on it has no effect and an absolute-positioned badge ends up
+    // anchored to some unrelated ancestor instead. The gridcell's own first child div
+    // is the real, boxed wrapper (mirrors decky-nonsteam-badges' identical handling of
+    // this same native capsule type).
+    targetElement = (img ? (capsule.querySelector("div") as HTMLElement | null) : null) ?? (capsule as HTMLElement);
+  } else if (role === "listitem") {
+    targetElement =
+      (img?.closest('div[class*="_1pwP4"]') as HTMLElement | null) ??
+      (img?.closest("div") as HTMLElement | null) ??
+      (capsule as HTMLElement);
+  } else {
+    targetElement = capsule as HTMLElement;
+  }
+
+  const desiredClassName = `${LOCKED_BADGE_CLASSNAME} ${cachedSettings?.locked_badge_position ?? "top-left"}`;
+
+  // Navigation Persistence Fix: if a badge exists but isn't a direct child of the
+  // current target (React throws away and regenerates capsule DOM on navigation), drop
+  // the stale one and re-create it below. If it's already correctly parented, just keep
+  // its className in sync with the current position setting instead of leaving it as
+  // whatever it was when first created — otherwise changing the position dropdown never
+  // affects an already-badged capsule until its DOM happens to get thrown away.
+  if (existing) {
+    if (existing.parentElement !== targetElement) {
+      existing.remove();
+    } else {
+      if (existing.className !== desiredClassName) existing.className = desiredClassName;
+      return;
+    }
+  }
+
+  const win = doc.defaultView;
+  const computedPosition = win ? win.getComputedStyle(targetElement).position : targetElement.style.position;
+  if (computedPosition === "static" || !computedPosition) {
+    targetElement.style.position = "relative";
+  }
+
+  const badge = doc.createElement("div");
+  badge.className = desiredClassName;
+  badge.innerHTML = LOCKED_BADGE_LOCK_SVG;
+  targetElement.appendChild(badge);
+}
+
+function scanAndApplyLockedBadges(doc: Document) {
+  injectLockedBadgeStyle(doc);
+  const selectors = [
+    'div[role="tabpanel"] div[role="gridcell"]', // Library grid
+    '.ReactVirtualized__Grid__innerScrollContainer div[role="listitem"]', // Home/Recent carousels
+  ];
+  for (const selector of selectors) {
+    doc.querySelectorAll(selector).forEach((capsule) => applyLockedBadgeToCapsule(capsule, doc));
+  }
+}
+
+function startLockedBadgeWatcher(doc: Document): () => void {
+  scanAndApplyLockedBadges(doc);
+
+  let debounceHandle: number | null = null;
+  const debouncedScan = () => {
+    if (debounceHandle != null) return;
+    debounceHandle = (doc.defaultView ?? window).requestAnimationFrame(() => {
+      scanAndApplyLockedBadges(doc);
+      debounceHandle = null;
+    });
+  };
+
+  const observer = new MutationObserver((mutations) => {
+    if (mutations.some((m) => m.addedNodes.length > 0)) debouncedScan();
+  });
+  doc.querySelectorAll('div[role="tabpanel"], div[class*="Panel"]').forEach((container) => {
+    observer.observe(container, { childList: true, subtree: true });
+  });
+
+  // Backup: catches games scrolled into view without a qualifying mutation, and
+  // whenever locked_badge_enabled/locked_apps/position changes (no dedicated
+  // settings-changed event for this — cheap enough to just re-check on this interval).
+  const interval = setInterval(() => scanAndApplyLockedBadges(doc), 2000);
+
+  return () => {
+    observer.disconnect();
+    clearInterval(interval);
+    if (debounceHandle != null) (doc.defaultView ?? window).cancelAnimationFrame(debounceHandle);
+  };
 }
 
 // Invisible global component (mounted via routerHook.addGlobalComponent) that guards
@@ -816,6 +2338,8 @@ function GlobalMenuWatcher() {
     if (!ref.current) return;
     const realDoc = ref.current.ownerDocument;
     if (!realDoc) return;
+
+    const stopLockedBadgeWatcher = startLockedBadgeWatcher(realDoc);
 
     let hiddenOptionsEl: any = null;
     let lastFocusedTileEl: any = null;
@@ -1015,6 +2539,7 @@ function GlobalMenuWatcher() {
       realDoc.removeEventListener("focus", onFocusChange, true);
       realDoc.removeEventListener("focusin", onFocusChange, true);
       restoreOptionsHint();
+      stopLockedBadgeWatcher();
     };
   }, []);
 
@@ -1497,12 +3022,49 @@ function patchAppPage() {
   });
 }
 
+// Shared expand/collapse pattern for settings sections (Lock Method, More Settings,
+// Show Games List, Show Plugin List, and any future ones): a toggle button, and its
+// content indented and given a top gap when expanded so it reads as subordinate to it.
+function CollapsibleSection({
+  label,
+  expanded,
+  onToggle,
+  topMargin,
+  children,
+}: {
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+  topMargin?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <>
+      <PanelSectionRow>
+        <div style={topMargin ? { marginTop: "12px" } : undefined}>
+          <DialogButton
+            onClick={onToggle}
+            style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between" }}
+          >
+            <span>{label}</span>
+            {expanded ? <FaChevronDown size={14} /> : <FaChevronRight size={14} />}
+          </DialogButton>
+        </div>
+      </PanelSectionRow>
+      {expanded && <div style={{ marginTop: "8px", paddingLeft: "16px" }}>{children}</div>}
+    </>
+  );
+}
+
 // Quick-Access Menu panel content. Shows a PIN entry gate first when QAM lock is
 // enabled and a PIN has been set, then the main settings panel.
 function Content() {
   const [settings, setSettings] = useState<DeckLockerSettings>({
     global_lock_enabled: false,
     locked_apps: [],
+    locked_plugins: [],
+    locked_qam_tabs: [],
+    locked_main_menu_items: [],
     pin_set: false,
     qam_lock_enabled: false,
     keypad_corner_radius: 14,
@@ -1510,103 +3072,129 @@ function Content() {
     lockscreen_bg_blur_px: 8,
     lockscreen_bg_opacity_percent: 30,
     relock_animation_enabled: true,
-    keypad_circle_shape: false,
+    keypad_shape: "rounded",
     keypad_glass_effect: false,
     keypad_on_right: false,
     relock_on_sleep: false,
     relock_on_exit: false,
     decky_panel_lock_enabled: false,
+    hide_game_art: false,
+    keypad_key_size: 80,
+    keypad_font_size: 22,
+    locked_badge_enabled: true,
+    locked_badge_position: "top-left",
+    lock_method: "pin",
   });
   const [apps, setApps] = useState<AppInfo[]>([]);
+  const [otherPlugins, setOtherPlugins] = useState<{ name: string; icon?: ReactNode }[]>([]);
   const [showGamesList, setShowGamesList] = useState(false);
+  const [showPluginList, setShowPluginList] = useState(false);
+  const [showTabsList, setShowTabsList] = useState(false);
+  const [showMainMenuItemsList, setShowMainMenuItemsList] = useState(false);
   const [showLockMethod, setShowLockMethod] = useState(false);
   const [showCustomization, setShowCustomization] = useState(false);
+  const [showMoreSettings, setShowMoreSettings] = useState(false);
 
-  const [qamUnlocked, setQamUnlocked] = useState(() => {
-    // Cancel a pending "panel closed" reset — this mount means we're still within the
-    // same QAM session (a tab switch), not a real panel close.
-    if (qamCloseResetTimer) {
-      clearTimeout(qamCloseResetTimer);
-      qamCloseResetTimer = null;
-    }
-    return qamUnlockedThisSession;
-  });
+  // Persists once unlocked — closing/reopening the QAM (or switching tabs) no longer
+  // re-locks it; only an explicit relock event (sleep, if Re-lock on Sleep is enabled)
+  // resets qamUnlockedThisSession.
+  const [qamUnlocked, setQamUnlocked] = useState(() => qamUnlockedThisSession);
   const [qamPinInput, setQamPinInput] = useState("");
   const [qamPinError, setQamPinError] = useState("");
   const qamPinInputWrapperRef = useRef<HTMLDivElement | null>(null);
 
-  // Makes the underlying input text invisible and lets dot overlays show the PIN instead,
-  // since bIsPassword on TextField does not actually mask text in Steam's UI. The
-  // background is forced to a fixed dark color because it turns white on focus and
-  // would make white dots invisible while typing.
+  // Hides the real typed digits (bIsPassword doesn't actually mask text in Steam's UI)
+  // so the dot overlay below is the only thing visibly showing PIN length. The dots use
+  // mix-blend-mode: difference instead of forcing a fixed background color — Steam's
+  // native focus style turns the input's background white, and a hardcoded dark
+  // background would both fight that and drift from whatever theme is active; a
+  // difference blend stays visible against light or dark automatically.
   useEffect(() => {
     const input = qamPinInputWrapperRef.current?.querySelector("input") as HTMLInputElement | null;
     if (input) {
       input.style.color = "transparent";
       input.style.caretColor = "transparent";
       (input.style as any).WebkitTextFillColor = "transparent";
-      input.style.setProperty("background-color", "#23262e", "important");
-      input.style.transition = "border-color 0.1s";
     }
   }, [qamPinInput]);
-
-  // Adds a border focus indicator driven by Steam's gpfocus CSS class via
-  // MutationObserver, since native focus/blur events are unreliable for this input.
-  useEffect(() => {
-    const input = qamPinInputWrapperRef.current?.querySelector("input") as HTMLInputElement | null;
-    if (!input) return undefined;
-    const applyBorder = () => {
-      const focused = input.className.split(/\s+/).includes("gpfocus");
-      input.style.setProperty("border", focused ? "2px solid #fff" : "2px solid transparent", "important");
-    };
-    applyBorder();
-    const observer = new MutationObserver(applyBorder);
-    observer.observe(input, { attributes: true, attributeFilter: ["class"] });
-    return () => observer.disconnect();
-  }, [qamPinInput]);
-
-  // Starts the QAM close timer on unmount. If the component remounts before it fires
-  // (a tab switch), the new mount cancels it and the unlocked state is preserved.
-  useEffect(() => {
-    return () => {
-      qamCloseResetTimer = setTimeout(() => {
-        qamUnlockedThisSession = false;
-        qamCloseResetTimer = null;
-      }, 3000);
-    };
-  }, []);
 
   useEffect(() => {
     getSettings().then(setSettings);
     setApps(getInstalledApps());
   }, []);
 
+  // Refreshes the "other installed plugins" list each time the panel is opened, since
+  // it's read from Decky Loader's own live plugin state rather than something we own.
+  useEffect(() => {
+    if (!showPluginList) return;
+    const state = getDeckyStateValue();
+    setOtherPlugins(
+      (state?.plugins ?? [])
+        .filter((p) => p.name !== "Deck Locker")
+        .map((p) => ({ name: p.name, icon: p.icon }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    );
+  }, [showPluginList]);
+
   const onGlobalToggle = async (checked: boolean) => {
     const updated = await setGlobalLock(checked);
     setSettings(updated);
+    cachedSettings = updated;
   };
 
   const onQamLockToggle = async (checked: boolean) => {
-    let updated = await setQamLock(checked);
-    // Mutually exclusive with decky_panel_lock_enabled — enabling one disables the other.
-    if (checked && settings.decky_panel_lock_enabled) {
-      updated = await setCustomization({ decky_panel_lock_enabled: false });
-    }
+    const updated = await setQamLock(checked);
     setSettings(updated);
+    cachedSettings = updated;
   };
 
   const onDeckyPanelLockToggle = async (checked: boolean) => {
-    let updated = await setCustomization({ decky_panel_lock_enabled: checked });
-    // Mutually exclusive with qam_lock_enabled — enabling one disables the other.
-    if (checked && settings.qam_lock_enabled) {
-      updated = await setQamLock(false);
-    }
+    const updated = await setCustomization({ decky_panel_lock_enabled: checked });
     setSettings(updated);
+    cachedSettings = updated;
+  };
+
+  const onRelockOnSleepToggle = async (checked: boolean) => {
+    const updated = await setCustomization({ relock_on_sleep: checked });
+    setSettings(updated);
+    cachedSettings = updated;
+  };
+
+  const onRelockOnExitToggle = async (checked: boolean) => {
+    const updated = await setCustomization({ relock_on_exit: checked });
+    setSettings(updated);
+    cachedSettings = updated;
   };
 
   const onAppToggle = async (appid: string, checked: boolean) => {
     const lockedApps = await toggleApp(appid, checked);
     setSettings((prev) => ({ ...prev, locked_apps: lockedApps }));
+    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_apps: lockedApps };
+  };
+
+  const onPluginToggle = async (pluginName: string, checked: boolean) => {
+    const lockedPlugins = await togglePluginLock(pluginName, checked);
+    setSettings((prev) => ({ ...prev, locked_plugins: lockedPlugins }));
+    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_plugins: lockedPlugins };
+    // Apply immediately rather than waiting for the next time the Decky tab becomes
+    // active — the user is already looking at this plugin's own panel right now.
+    applyPluginLocks();
+  };
+
+  const onQamTabToggle = async (tabName: string, checked: boolean) => {
+    const lockedTabs = await toggleQamTabLock(tabName, checked);
+    setSettings((prev) => ({ ...prev, locked_qam_tabs: lockedTabs }));
+    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_qam_tabs: lockedTabs };
+    // No immediate apply needed here — the toggled tab isn't the one currently
+    // visible (the user is looking at this settings panel, on Decky's own tab), and
+    // the wrap/unwrap runs on every QAM render regardless, which happens often enough
+    // while the QAM stays open.
+  };
+
+  const onMainMenuItemToggle = async (itemName: string, checked: boolean) => {
+    const lockedItems = await toggleMainMenuItemLock(itemName, checked);
+    setSettings((prev) => ({ ...prev, locked_main_menu_items: lockedItems }));
+    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_main_menu_items: lockedItems };
   };
 
   const onCustomizationChange = async (updates: Partial<DeckLockerSettings>) => {
@@ -1645,6 +3233,7 @@ function Content() {
                 setQamPinInput(e.target.value.replace(/\D/g, ""));
               }}
               bIsPassword={true}
+              focusOnMount={true}
             />
             {qamPinInput.length > 0 && (
               <div
@@ -1657,6 +3246,7 @@ function Content() {
                   alignItems: "center",
                   gap: "6px",
                   pointerEvents: "none",
+                  mixBlendMode: "difference",
                 }}
               >
                 {qamPinInput.split("").map((_, i) => (
@@ -1685,7 +3275,7 @@ function Content() {
       <PanelSection>
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ fontWeight: "bold" }}>Customization</div>
+            <div style={{ fontWeight: "bold" }}>CUSTOMIZATION</div>
             <DialogButton
               onClick={() => setShowCustomization(false)}
               style={{ width: "32px", minWidth: "32px", padding: "4px" }}
@@ -1696,22 +3286,28 @@ function Content() {
         </PanelSectionRow>
 
         <PanelSectionRow>
-          <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>PIN</div>
+          <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>KEYPAD</div>
         </PanelSectionRow>
 
         <PanelSectionRow>
-          <ToggleField
-            label="Circle Keys"
-            description="Makes keys fully circular"
-            checked={settings.keypad_circle_shape}
-            onChange={(checked) => onCustomizationChange({ keypad_circle_shape: checked })}
+          <DropdownItem
+            label="Key Shape"
+            description="Choose the shape of the keypad buttons"
+            rgOptions={[
+              { data: "square", label: "Square" },
+              { data: "rounded", label: "Rounded" },
+              { data: "circle", label: "Circle" },
+            ]}
+            selectedOption={settings.keypad_shape}
+            onChange={(option) => onCustomizationChange({ keypad_shape: option.data })}
           />
         </PanelSectionRow>
 
-        {!settings.keypad_circle_shape && (
+        {settings.keypad_shape === "rounded" && (
           <PanelSectionRow>
             <SliderField
-              label="Keypad Corner Roundness"
+              label="Corner Roundness"
+              description="How rounded the key corners are"
               value={settings.keypad_corner_radius}
               min={0}
               max={36}
@@ -1722,22 +3318,48 @@ function Content() {
         )}
 
         <PanelSectionRow>
-          <ToggleField
-            label="Glass Effect"
-            description="Semi-transparent, blurred keypad background"
-            checked={settings.keypad_glass_effect}
-            onChange={(checked) => onCustomizationChange({ keypad_glass_effect: checked })}
+          <SliderField
+            label="Key Size"
+            description="Size of each keypad button"
+            value={settings.keypad_key_size}
+            min={60}
+            max={110}
+            step={2}
+            onChange={(value: number) => onCustomizationChange({ keypad_key_size: value })}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <SliderField
+            label="Number Size"
+            description="Size of the numbers on each key"
+            value={settings.keypad_font_size}
+            min={14}
+            max={32}
+            step={1}
+            onChange={(value: number) => onCustomizationChange({ keypad_font_size: value })}
           />
         </PanelSectionRow>
 
         <PanelSectionRow>
           <ToggleField
-            label="Keypad on Right"
-            description="Swap sides — keypad on the right, game art on the left"
-            checked={settings.keypad_on_right}
-            onChange={(checked) => onCustomizationChange({ keypad_on_right: checked })}
+            label="Glass Effect"
+            description="Frosted-glass look for the keypad buttons"
+            checked={settings.keypad_glass_effect}
+            onChange={(checked) => onCustomizationChange({ keypad_glass_effect: checked })}
           />
         </PanelSectionRow>
+
+        {!settings.hide_game_art && (
+          <PanelSectionRow>
+            <ToggleField
+              label="Swap Keypad Side"
+              description="Move the keypad to the right, game art to the left"
+              checked={settings.keypad_on_right}
+              onChange={(checked) => onCustomizationChange({ keypad_on_right: checked })}
+            />
+          </PanelSectionRow>
+        )}
 
         <PanelSectionRow>
           <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>GENERAL</div>
@@ -1745,8 +3367,17 @@ function Content() {
 
         <PanelSectionRow>
           <ToggleField
-            label="Lock Screen Game Background"
-            description="Use the game's hero art as the lock screen background"
+            label="Keypad Only"
+            description="Hide the game cover art and show just the centered keypad"
+            checked={settings.hide_game_art}
+            onChange={(checked) => onCustomizationChange({ hide_game_art: checked })}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ToggleField
+            label="Blurred Background"
+            description="Show the game's art blurred behind the lock screen"
             checked={settings.lockscreen_hero_bg_enabled}
             onChange={(checked) => onCustomizationChange({ lockscreen_hero_bg_enabled: checked })}
           />
@@ -1757,6 +3388,7 @@ function Content() {
             <PanelSectionRow>
               <SliderField
                 label="Background Blur"
+                description="How blurry the background looks"
                 value={settings.lockscreen_bg_blur_px}
                 min={0}
                 max={20}
@@ -1768,6 +3400,7 @@ function Content() {
             <PanelSectionRow>
               <SliderField
                 label="Background Opacity"
+                description="How visible the background is"
                 value={settings.lockscreen_bg_opacity_percent}
                 min={0}
                 max={100}
@@ -1781,11 +3414,42 @@ function Content() {
         <PanelSectionRow>
           <ToggleField
             label="Re-lock Animation"
-            description="Show the lock-closing animation when manually re-locking a game"
+            description="Play a closing-lock animation when you manually re-lock a game"
             checked={settings.relock_animation_enabled}
             onChange={(checked) => onCustomizationChange({ relock_animation_enabled: checked })}
           />
         </PanelSectionRow>
+
+        <PanelSectionRow>
+          <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>LOCKED BADGES</div>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ToggleField
+            label="Enable Locked Badges"
+            description="Show a lock icon on locked games' covers in Home, Recent, and the Library"
+            checked={settings.locked_badge_enabled}
+            onChange={(checked) => onCustomizationChange({ locked_badge_enabled: checked })}
+          />
+        </PanelSectionRow>
+
+        {settings.locked_badge_enabled && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="Badge Position"
+              description="Applies everywhere the badge appears (Home, Recent, Library, etc.)"
+              rgOptions={[
+                { data: "top-left", label: "Top Left" },
+                { data: "top-right", label: "Top Right" },
+                { data: "center", label: "Center" },
+                { data: "bottom-left", label: "Bottom Left" },
+                { data: "bottom-right", label: "Bottom Right" },
+              ]}
+              selectedOption={settings.locked_badge_position}
+              onChange={(option) => onCustomizationChange({ locked_badge_position: option.data })}
+            />
+          </PanelSectionRow>
+        )}
 
         <PanelSectionRow>
           <div style={{ marginTop: "12px" }}>
@@ -1793,14 +3457,19 @@ function Content() {
               layout="below"
               onClick={() =>
                 onCustomizationChange({
+                  keypad_shape: "rounded",
                   keypad_corner_radius: 14,
-                  keypad_circle_shape: false,
+                  keypad_key_size: 80,
+                  keypad_font_size: 22,
                   keypad_glass_effect: false,
                   keypad_on_right: false,
+                  hide_game_art: false,
                   lockscreen_hero_bg_enabled: false,
                   lockscreen_bg_blur_px: 8,
                   lockscreen_bg_opacity_percent: 30,
                   relock_animation_enabled: true,
+                  locked_badge_enabled: true,
+                  locked_badge_position: "top-left",
                 })
               }
             >
@@ -1820,7 +3489,7 @@ function Content() {
       <PanelSectionRow>
         <ToggleField
           label="Enable Lock"
-          description="Require a PIN for locked games"
+          description="Require a PIN to access locked content"
           checked={settings.global_lock_enabled}
           onChange={onGlobalToggle}
         />
@@ -1828,26 +3497,25 @@ function Content() {
 
       {settings.global_lock_enabled && (
         <>
-          <PanelSectionRow>
-            <div style={{ marginTop: "12px" }}>
-              <DialogButton
-                onClick={() => setShowLockMethod((v) => !v)}
-                style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between" }}
-              >
-                <span>Lock Method</span>
-                {showLockMethod ? <FaChevronDown size={14} /> : <FaChevronRight size={14} />}
-              </DialogButton>
-            </div>
-          </PanelSectionRow>
-
-          {showLockMethod && (
-            <PanelSectionRow>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 4px", opacity: 0.9 }}>
-                <span>PIN</span>
-                <FaCheck size={14} color="#4caf50" />
-              </div>
-            </PanelSectionRow>
-          )}
+          <CollapsibleSection
+            label="Lock Method"
+            expanded={showLockMethod}
+            onToggle={() => setShowLockMethod((v) => !v)}
+            topMargin
+          >
+            {LOCK_METHOD_OPTIONS.map((method) => (
+              <PanelSectionRow key={method.data}>
+                <Field
+                  label={method.label}
+                  disabled={!method.implemented}
+                  focusable={method.implemented}
+                  onActivate={() => onCustomizationChange({ lock_method: method.data })}
+                >
+                  {settings.lock_method === method.data && <FaCheck size={14} color="#4caf50" />}
+                </Field>
+              </PanelSectionRow>
+            ))}
+          </CollapsibleSection>
 
           <PanelSectionRow>
             <ButtonItem
@@ -1870,88 +3538,184 @@ function Content() {
             </ButtonItem>
           </PanelSectionRow>
 
+          <CollapsibleSection
+            label="More Settings"
+            expanded={showMoreSettings}
+            onToggle={() => setShowMoreSettings((v) => !v)}
+          >
+            <PanelSectionRow>
+              <ToggleField
+                label="Lock Decky Panel"
+                description="Require a PIN before the Decky plugin list is shown"
+                checked={settings.decky_panel_lock_enabled}
+                onChange={onDeckyPanelLockToggle}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Re-lock on Sleep"
+                description="Lock everything again when the Steam Deck goes to sleep"
+                checked={settings.relock_on_sleep}
+                onChange={onRelockOnSleepToggle}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Re-lock When Leaving Game"
+                description="Ask for the PIN again each time you revisit a locked game's page"
+                checked={settings.relock_on_exit}
+                onChange={onRelockOnExitToggle}
+              />
+            </PanelSectionRow>
+          </CollapsibleSection>
+
+          <PanelSectionRow>
+            <div style={{ height: "1px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "4px" }} />
+          </PanelSectionRow>
+
           {settings.pin_set && (
             <>
               <PanelSectionRow>
-                <div style={{ fontWeight: "bold", marginTop: "8px" }}>GAMES</div>
+                <div style={{ fontWeight: "bold", marginTop: "16px" }}>GAMES</div>
                 <div style={{ fontSize: "12px", opacity: 0.7, marginTop: "2px" }}>
-                  Lists all games, including non-Steam
+                  Choose which games require a PIN, including non-Steam games
                 </div>
               </PanelSectionRow>
 
-              <PanelSectionRow>
-                <div style={{ marginTop: "12px" }}>
-                  <DialogButton
-                    onClick={() => setShowGamesList((v) => !v)}
-                    style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between" }}
-                  >
-                    <span>Show Games List</span>
-                    {showGamesList ? <FaChevronDown size={14} /> : <FaChevronRight size={14} />}
-                  </DialogButton>
-                </div>
-              </PanelSectionRow>
-
-              {showGamesList && (
-                <>
-                  {apps.length === 0 && (
-                    <PanelSectionRow>
-                      <div>No installed games found.</div>
-                    </PanelSectionRow>
-                  )}
-                  {apps.map((app) => (
-                    <PanelSectionRow key={app.appid}>
-                      <ToggleField
-                        label={app.display_name}
-                        checked={settings.locked_apps.includes(app.appid)}
-                        onChange={(checked) => onAppToggle(app.appid, checked)}
-                      />
-                    </PanelSectionRow>
-                  ))}
-                </>
-              )}
+              <CollapsibleSection
+                label="Show Games List"
+                expanded={showGamesList}
+                onToggle={() => setShowGamesList((v) => !v)}
+                topMargin
+              >
+                {apps.length === 0 && (
+                  <PanelSectionRow>
+                    <div>No installed games found.</div>
+                  </PanelSectionRow>
+                )}
+                {apps.map((app) => (
+                  <PanelSectionRow key={app.appid}>
+                    <ToggleField
+                      label={app.display_name}
+                      checked={settings.locked_apps.includes(app.appid)}
+                      onChange={(checked) => onAppToggle(app.appid, checked)}
+                    />
+                  </PanelSectionRow>
+                ))}
+              </CollapsibleSection>
 
               <PanelSectionRow>
                 <div style={{ height: "1px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "4px" }} />
-                <div style={{ fontWeight: "bold", marginTop: "8px" }}>OTHERS</div>
+                <div style={{ fontWeight: "bold", marginTop: "8px" }}>PLUGINS</div>
                 <div style={{ fontSize: "12px", opacity: 0.7, marginTop: "2px" }}>
-                  Additional settings for this plugin
+                  Lock access to Decky plugins
                 </div>
               </PanelSectionRow>
 
-              <PanelSectionRow>
-                <ToggleField
-                  label="Enable Lock This Plugin"
-                  description="Require a PIN to open this plugin's settings panel"
-                  checked={settings.qam_lock_enabled}
-                  onChange={onQamLockToggle}
-                />
-              </PanelSectionRow>
+              <CollapsibleSection
+                label="Show Plugin List"
+                expanded={showPluginList}
+                onToggle={() => setShowPluginList((v) => !v)}
+                topMargin
+              >
+                <PanelSectionRow>
+                  <ToggleField
+                    label="Deck Locker"
+                    description="Require a PIN to open this plugin's settings panel"
+                    checked={settings.qam_lock_enabled}
+                    onChange={onQamLockToggle}
+                  />
+                </PanelSectionRow>
+                {otherPlugins.length === 0 && (
+                  <PanelSectionRow>
+                    <div style={{ fontSize: "12px", opacity: 0.6, marginTop: "2px" }}>
+                      No other plugins found.
+                    </div>
+                  </PanelSectionRow>
+                )}
+                {otherPlugins.map((plugin) => (
+                  <PanelSectionRow key={plugin.name}>
+                    <ToggleField
+                      label={plugin.name}
+                      description="Require a PIN before this plugin's content is shown"
+                      checked={settings.locked_plugins.includes(plugin.name)}
+                      onChange={(checked) => onPluginToggle(plugin.name, checked)}
+                    />
+                  </PanelSectionRow>
+                ))}
+              </CollapsibleSection>
 
               <PanelSectionRow>
-                <ToggleField
-                  label="Enable Lock Decky Panel"
-                  description="Require a PIN before the Decky plugin list is shown (disables Lock This Plugin)"
-                  checked={settings.decky_panel_lock_enabled}
-                  onChange={onDeckyPanelLockToggle}
-                />
+                <div style={{ height: "1px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "4px" }} />
+                <div style={{ fontWeight: "bold", marginTop: "8px" }}>QUICK MENU</div>
+                <div style={{ fontSize: "12px", opacity: 0.7, marginTop: "2px" }}>
+                  Lock access to Quick Access Menu tabs
+                </div>
               </PanelSectionRow>
 
-              <PanelSectionRow>
-                <ToggleField
-                  label="Re-lock on Sleep"
-                  description="Clear all game unlocks when the Steam Deck goes to sleep"
-                  checked={settings.relock_on_sleep}
-                  onChange={(checked) => onCustomizationChange({ relock_on_sleep: checked })}
-                />
-              </PanelSectionRow>
+              <CollapsibleSection
+                label="Show Tabs List"
+                expanded={showTabsList}
+                onToggle={() => setShowTabsList((v) => !v)}
+                topMargin
+              >
+                {BUILTIN_LOCKABLE_TABS.map((tab) => (
+                  <PanelSectionRow key={tab.name}>
+                    <ToggleField
+                      label={tab.name}
+                      description="Require a PIN before this tab's content is shown"
+                      checked={settings.locked_qam_tabs.includes(tab.name)}
+                      onChange={(checked) => onQamTabToggle(tab.name, checked)}
+                    />
+                  </PanelSectionRow>
+                ))}
+              </CollapsibleSection>
 
               <PanelSectionRow>
-                <ToggleField
-                  label="Re-lock When Leaving Game"
-                  description="Require PIN again each time you navigate to a locked game's page"
-                  checked={settings.relock_on_exit}
-                  onChange={(checked) => onCustomizationChange({ relock_on_exit: checked })}
-                />
+                <div style={{ height: "1px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "4px" }} />
+                <div style={{ fontWeight: "bold", marginTop: "8px" }}>STEAM MENU</div>
+                <div style={{ fontSize: "12px", opacity: 0.7, marginTop: "2px" }}>
+                  Lock access to items in the Steam button menu
+                </div>
+              </PanelSectionRow>
+
+              <CollapsibleSection
+                label="Show Items List"
+                expanded={showMainMenuItemsList}
+                onToggle={() => setShowMainMenuItemsList((v) => !v)}
+                topMargin
+              >
+                {MAIN_MENU_LOCKABLE_ITEMS.map((item) => (
+                  <PanelSectionRow key={item}>
+                    <ToggleField
+                      label={item}
+                      description="Require a PIN before this item's content is shown"
+                      checked={settings.locked_main_menu_items.includes(item)}
+                      onChange={(checked) => onMainMenuItemToggle(item, checked)}
+                    />
+                  </PanelSectionRow>
+                ))}
+              </CollapsibleSection>
+
+              <PanelSectionRow>
+                <div style={{ height: "3px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "12px", borderRadius: "2px" }} />
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <FaGithub size={28} color="#fff" style={{ flexShrink: 0, opacity: 0.85 }} />
+                  <DialogButton
+                    onClick={() => Navigation.NavigateToExternalWeb(DECKLOCKER_GITHUB_URL)}
+                    style={{ flex: 1 }}
+                  >
+                    Open Project
+                  </DialogButton>
+                  <DialogButton
+                    onClick={() => showModal(<ProjectQrModal />)}
+                    style={{ width: "40px", minWidth: "40px", padding: "10px", flexShrink: 0 }}
+                  >
+                    <FaQrcode size={16} />
+                  </DialogButton>
+                </div>
               </PanelSectionRow>
             </>
           )}
@@ -1961,13 +3725,30 @@ function Content() {
   );
 }
 
+// Fallback for when the Steam Client removes SteamClient.System.RegisterForOnSuspendRequest /
+// RegisterForOnResumeFromSuspend (this has happened on Steam Beta Client releases — see
+// SteamDeckHomebrew/decky-loader#803, unresolved upstream). The private webpack module that
+// backs those two calls is still reachable directly; same technique used by decky-autosuspend.
+const SleepManager = findModuleChild((m: any) => {
+  if (typeof m !== "object" || m === null) return undefined;
+  for (const prop in m) {
+    try {
+      if (m[prop]?.RegisterForNotifyResumeFromSuspend) return m[prop];
+    } catch {
+      return undefined;
+    }
+  }
+});
+
 export default definePlugin(() => {
   getSettingsCached().catch((e) => console.error("DeckLocker: initial settings warm-up failed", e));
 
   const libraryAppPagePatch = patchAppPage();
+  const stopLibraryRouteLockWatcher = startLibraryRouteLockWatcher();
 
   routerHook.addGlobalComponent("DeckLockerMenuWatcher", GlobalMenuWatcher);
-  routerHook.addGlobalComponent("DeckLockerQamGate", GlobalDeckyQamGate);
+  const qamDeckyTabLockHook = patchQamDeckyTabLock();
+  const mainMenuLockHook = patchMainMenuLock();
 
   // Safety-net hook: catches games that start running despite the page gate (e.g.
   // launched from outside the library via a shortcut) and kills them before
@@ -1993,7 +3774,8 @@ export default definePlugin(() => {
     console.error("DeckLocker: could not register lifetime hook", e);
   }
 
-  // Clears all per-session game unlocks when the Steam Deck goes to sleep,
+  // Clears all per-session game unlocks, plus the QAM/Decky panel unlocks (which
+  // otherwise persist indefinitely once entered), when the Steam Deck goes to sleep,
   // if the user has relock_on_sleep enabled.
   let suspendHook: any;
   const relockOnSuspend = () => {
@@ -2001,19 +3783,26 @@ export default definePlugin(() => {
     if (s?.relock_on_sleep) {
       unlockedThisSession.clear();
       settledThisSession.clear();
+      qamUnlockedThisSession = false;
+      deckyQamLocked = true;
     }
   };
-  const suspendApis = ["RegisterForOnSuspendRequest", "RegisterForOnResumeFromSuspend"];
-  for (const apiName of suspendApis) {
+  const suspendRegistrars: Array<[string, (cb: () => void) => any]> = [
+    ["SteamClient.System.RegisterForOnSuspendRequest", (cb) => (window as any).SteamClient?.System?.RegisterForOnSuspendRequest?.(cb)],
+    ["SteamClient.System.RegisterForOnResumeFromSuspend", (cb) => (window as any).SteamClient?.System?.RegisterForOnResumeFromSuspend?.(cb)],
+    ["SleepManager.RegisterForNotifyRequestSuspend", (cb) => SleepManager?.RegisterForNotifyRequestSuspend?.(cb)],
+    ["SleepManager.RegisterForNotifyResumeFromSuspend", (cb) => SleepManager?.RegisterForNotifyResumeFromSuspend?.(cb)],
+  ];
+  for (const [label, register] of suspendRegistrars) {
     try {
-      const fn = (window as any).SteamClient?.System?.[apiName];
-      if (typeof fn === "function") {
-        suspendHook = fn.call((window as any).SteamClient.System, relockOnSuspend);
-        console.log("DeckLocker: registered suspend hook via SteamClient.System." + apiName);
+      const result = register(relockOnSuspend);
+      if (result) {
+        suspendHook = result;
+        console.log("DeckLocker: registered suspend hook via " + label);
         break;
       }
     } catch (e) {
-      console.warn("DeckLocker: SteamClient.System." + apiName + " failed:", e);
+      console.warn("DeckLocker: " + label + " failed:", e);
     }
   }
   if (!suspendHook) {
@@ -2027,8 +3816,10 @@ export default definePlugin(() => {
     icon: <FaLock />,
     onDismount() {
       routerHook.removePatch("/library/app/:appid", libraryAppPagePatch);
+      stopLibraryRouteLockWatcher();
       routerHook.removeGlobalComponent("DeckLockerMenuWatcher");
-      routerHook.removeGlobalComponent("DeckLockerQamGate");
+      qamDeckyTabLockHook.unregister();
+      mainMenuLockHook.unregister();
       lifetimeHook?.unregister?.();
       suspendHook?.unregister?.();
     },

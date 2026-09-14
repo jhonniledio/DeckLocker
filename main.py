@@ -35,29 +35,52 @@ class Plugin:
             self.settings.setdefault("lockscreen_bg_blur_px", 8)
             self.settings.setdefault("lockscreen_bg_opacity_percent", 30)
             self.settings.setdefault("relock_animation_enabled", True)
-            self.settings.setdefault("keypad_circle_shape", False)
+            # keypad_shape replaces the old keypad_circle_shape boolean — migrate any
+            # existing preference forward instead of silently resetting it.
+            self.settings.setdefault(
+                "keypad_shape",
+                "circle" if self.settings.get("keypad_circle_shape") else "rounded",
+            )
             self.settings.setdefault("keypad_glass_effect", False)
             self.settings.setdefault("keypad_on_right", False)
             self.settings.setdefault("relock_on_sleep", False)
             self.settings.setdefault("relock_on_exit", False)
             self.settings.setdefault("decky_panel_lock_enabled", False)
+            self.settings.setdefault("hide_game_art", False)
+            self.settings.setdefault("keypad_key_size", 80)
+            self.settings.setdefault("keypad_font_size", 22)
+            self.settings.setdefault("locked_plugins", [])
+            self.settings.setdefault("locked_qam_tabs", [])
+            self.settings.setdefault("locked_main_menu_items", [])
+            self.settings.setdefault("locked_badge_enabled", True)
+            self.settings.setdefault("locked_badge_position", "top-left")
+            self.settings.setdefault("lock_method", "pin")
         else:
             self.settings = {
                 "global_lock_enabled": False,
                 "pin_hash": "",
                 "locked_apps": [],
+                "locked_plugins": [],
+                "locked_qam_tabs": [],
+                "locked_main_menu_items": [],
                 "qam_lock_enabled": False,
                 "keypad_corner_radius": 14,
                 "lockscreen_hero_bg_enabled": False,
                 "lockscreen_bg_blur_px": 8,
                 "lockscreen_bg_opacity_percent": 30,
                 "relock_animation_enabled": True,
-                "keypad_circle_shape": False,
+                "keypad_shape": "rounded",
                 "keypad_glass_effect": False,
                 "keypad_on_right": False,
                 "relock_on_sleep": False,
                 "relock_on_exit": False,
                 "decky_panel_lock_enabled": False,
+                "hide_game_art": False,
+                "keypad_key_size": 80,
+                "keypad_font_size": 22,
+                "locked_badge_enabled": True,
+                "locked_badge_position": "top-left",
+                "lock_method": "pin",
             }
 
     async def _save_settings(self):
@@ -90,6 +113,12 @@ class Plugin:
         await self._save_settings()
         return self._public_settings()
 
+    # "lock_method" picks which credential type protects locked content ("pin" is the
+    # only one implemented so far; "password", "pattern", and "tap_code" are reserved
+    # for future methods and already round-trip through settings). Adding a new one
+    # needs: its own set_/check_ pair here (mirroring set_pin/check_pin) storing under
+    # its own settings key (never reuse "pin_hash"), and a matching credential-entry
+    # component on the frontend that reads/writes it based on settings.lock_method.
     async def set_pin(self, pin: str):
         self.settings["pin_hash"] = hashlib.sha256(pin.encode()).hexdigest()
         await self._save_settings()
@@ -108,6 +137,36 @@ class Plugin:
         self.settings["locked_apps"] = list(locked_apps)
         await self._save_settings()
         return self.settings["locked_apps"]
+
+    async def toggle_plugin_lock(self, plugin_name: str, locked: bool):
+        locked_plugins = set(self.settings.get("locked_plugins", []))
+        if locked:
+            locked_plugins.add(plugin_name)
+        else:
+            locked_plugins.discard(plugin_name)
+        self.settings["locked_plugins"] = list(locked_plugins)
+        await self._save_settings()
+        return self.settings["locked_plugins"]
+
+    async def toggle_qam_tab_lock(self, tab_name: str, locked: bool):
+        locked_qam_tabs = set(self.settings.get("locked_qam_tabs", []))
+        if locked:
+            locked_qam_tabs.add(tab_name)
+        else:
+            locked_qam_tabs.discard(tab_name)
+        self.settings["locked_qam_tabs"] = list(locked_qam_tabs)
+        await self._save_settings()
+        return self.settings["locked_qam_tabs"]
+
+    async def toggle_main_menu_item_lock(self, item_name: str, locked: bool):
+        locked_items = set(self.settings.get("locked_main_menu_items", []))
+        if locked:
+            locked_items.add(item_name)
+        else:
+            locked_items.discard(item_name)
+        self.settings["locked_main_menu_items"] = list(locked_items)
+        await self._save_settings()
+        return self.settings["locked_main_menu_items"]
 
     async def get_local_artwork(self, app_id: str) -> str:
         # Returns a data: URI for the best available local cover art, or "" if none found.
