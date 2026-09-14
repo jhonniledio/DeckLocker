@@ -1,7 +1,7 @@
 {
   "name": "DeckLocker",
   "version": "0.1.0",
-  "description": "Lock selected games behind a PIN so they can't be launched without entering it.",
+  "description": "Lock games, plugins, Quick Access Menu tabs, and Steam Menu items behind a PIN, with optional lock badges and deep lock-screen customization.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
@@ -13,7 +13,9 @@
     "plugin",
     "steam-deck",
     "parental-controls",
-    "pin-lock"
+    "pin-lock",
+    "quick-access-menu",
+    "main-menu"
   ],
   "author": "Borgs",
   "license": "BSD-3-Clause",
