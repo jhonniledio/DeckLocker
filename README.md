@@ -17,7 +17,7 @@ Built for the classic "someone borrows my Deck" problem: only the games you've a
 
 Not yet available on the Decky Plugin Store — install manually:
 
-1. Download the latest release zip
+1. Download the zip from the [latest release](https://github.com/jhonniledio/DeckLocker/releases/latest)
 2. In Decky Loader, go to **Settings → Install Plugin from ZIP** and select the file
 
 ## Usage
@@ -30,7 +30,18 @@ Whatever you lock will prompt for the PIN the next time it's opened. Games get a
 
 ### Forgot your PIN?
 
-Run `scripts/reset-decklocker.sh` from a terminal in Desktop Mode. It wipes Deck Locker back to a clean install (no PIN, everything unlocked) after confirming with you — a backup of your old settings is kept alongside it.
+1. Switch to **Desktop Mode** (Steam menu → Power → Switch to Desktop, or hold the Power button)
+2. Open a terminal (Konsole, on the taskbar/app menu)
+3. Run:
+   ```bash
+   cd ~/homebrew/plugins/DeckLocker/scripts
+   ./reset-decklocker.sh
+   ```
+   (If it's not executable: `chmod +x reset-decklocker.sh` first.)
+4. Confirm with `y` when prompted — it backs up your current `settings.json` (timestamped `.bak`) before wiping it
+5. When asked, choose whether to restart the Decky plugin loader now to apply the reset immediately, or apply it later on the next Steam/plugin loader restart
+
+Deck Locker then starts fresh with no PIN and everything unlocked.
 
 ## Notes
 
