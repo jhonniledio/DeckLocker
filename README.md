@@ -13,6 +13,23 @@ Built for the classic "someone borrows my Deck" problem: only the games you've a
 - Deep customization: keypad shape/size, glass effect, background art, re-lock animation, and more
 - Choose PIN, Password, Pattern, or Knock Code as your lock method — Controller Code is already on the settings menu, marked as it arrives
 
+## Screenshots
+
+<table>
+<tr>
+<td><img src="screenshots/Screenshot_20260915_220726.png" width="400" alt="PIN lock screen"/><br/><sub>PIN lock screen</sub></td>
+<td><img src="screenshots/Screenshot_20260915_221555.png" width="400" alt="Password lock screen"/><br/><sub>Password lock screen</sub></td>
+</tr>
+<tr>
+<td><img src="screenshots/Screenshot_20260915_221916.png" width="400" alt="Pattern lock screen"/><br/><sub>Pattern lock screen</sub></td>
+<td><img src="screenshots/Screenshot_20260915_221958.png" width="400" alt="Knock Code lock screen"/><br/><sub>Knock Code lock screen</sub></td>
+</tr>
+<tr>
+<td><img src="screenshots/Screenshot_20260915_221930.png" width="400" alt="Locked game shown on Home with a lock badge"/><br/><sub>Locked game shows a lock badge on Home</sub></td>
+<td><img src="screenshots/Screenshot_20260915_221504.png" width="400" alt="Deck Locker settings panel in the Quick Access Menu"/><br/><sub>Settings panel in the Quick Access Menu</sub></td>
+</tr>
+</table>
+
 ## Installation
 
 Not yet available on the Decky Plugin Store — install manually:
