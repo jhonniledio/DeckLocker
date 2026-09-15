@@ -18,6 +18,8 @@ import {
   gamepadContextMenuClasses,
   footerClasses,
   appActionButtonClasses,
+  gamepadSliderClasses,
+  gamepadDialogClasses,
   SliderField,
   DropdownItem,
   findModuleChild,
@@ -27,15 +29,15 @@ import {
   getReactRoot,
 } from "@decky/ui";
 import { callable, definePlugin, routerHook } from "@decky/api";
-import { useState, useEffect, useRef, cloneElement, ReactNode, RefObject } from "react";
-import { FaLock, FaBackspace, FaLockOpen, FaChevronRight, FaChevronLeft, FaChevronDown, FaTh, FaCheck, FaPalette, FaUndo, FaGithub, FaQrcode } from "react-icons/fa";
+import { useState, useEffect, useRef, cloneElement, ReactNode, RefObject, PointerEvent as ReactPointerEvent } from "react";
+import { FaLock, FaBackspace, FaLockOpen, FaChevronRight, FaChevronLeft, FaChevronDown, FaTh, FaCheck, FaPalette, FaUndo, FaGithub, FaQrcode, FaTrash } from "react-icons/fa";
 
-// Which credential type protects locked content. "pin" is the only one implemented;
-// the rest are reserved for future lock methods and already round-trip through
-// settings (see LOCK_METHOD_OPTIONS and the Lock Method picker in Content() below) so
-// adding one is a matter of building its own credential-entry UI and backend
-// set_/check_ pair (see the comment above set_pin/check_pin in main.py), not
-// restructuring settings again.
+// Which credential type protects locked content. "pin", "password", "pattern", and
+// "tap_code" are implemented; "controller_code" is reserved for a future lock method
+// and already round-trips through settings (see LOCK_METHOD_OPTIONS and the Lock
+// Method picker in Content() below) so adding it is a matter of building its own
+// credential-entry UI and backend set_/check_ pair (see _set_credential/_check_credential
+// in main.py), not restructuring settings again.
 type LockMethod = "pin" | "password" | "pattern" | "tap_code" | "controller_code";
 
 interface DeckLockerSettings {
@@ -45,6 +47,9 @@ interface DeckLockerSettings {
   locked_qam_tabs: string[];
   locked_main_menu_items: string[];
   pin_set: boolean;
+  password_set: boolean;
+  pattern_set: boolean;
+  tap_code_set: boolean;
   qam_lock_enabled: boolean;
   keypad_corner_radius: number;
   lockscreen_hero_bg_enabled: boolean;
@@ -63,6 +68,26 @@ interface DeckLockerSettings {
   locked_badge_enabled: boolean;
   locked_badge_position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
   lock_method: LockMethod;
+  pattern_dot_shape: "square" | "rounded" | "circle" | "none";
+  pattern_corner_radius: number;
+  pattern_dot_size: number;
+  pattern_glass_effect: boolean;
+  // Colors the pattern's dots/lines with the current theme's slider/progress accent
+  // color (see getThemeAccent) instead of plain white.
+  pattern_line_theme_color: boolean;
+  // Hides the line connecting the dots (while the drawn sequence is neutral) — only
+  // the dots themselves show.
+  pattern_line_transparent: boolean;
+  // Frosted-glass look for the dedicated Cancel/OK button row used by Password and
+  // Pattern (PIN's own Cancel/OK are keypad cells and already covered by
+  // keypad_glass_effect; Knock Code's own customization is intentionally minimal —
+  // see tap_code_show_outline/tap_code_show_dividers below).
+  action_button_glass_effect: boolean;
+  // Knock Code's only two customizable looks: the single outline around the whole 2x2
+  // area (not per-cell — there's nothing else to style per-cell, see KnockCodePad),
+  // and optional divider lines splitting it into 4 visible quadrants.
+  tap_code_show_outline: boolean;
+  tap_code_show_dividers: boolean;
 }
 
 interface AppInfo {
@@ -70,26 +95,105 @@ interface AppInfo {
   display_name: string;
 }
 
-// Lock Method picker options (see the "Lock Method" section in Content() below). Only
-// "pin" is selectable today — the rest are listed so the setting and UI already exist
-// once their own credential-entry screens are built; selecting one before then is a
-// no-op (see the picker's onChange).
+// Lock Method picker options (see the "Lock Method" section in Content() below).
+// "pin", "password", "pattern", and "tap_code" are selectable — the rest are listed so
+// the setting and UI already exist once their own credential-entry screens are built;
+// selecting one before then is a no-op (see the picker's onChange).
 const LOCK_METHOD_OPTIONS: { data: LockMethod; label: string; implemented: boolean }[] = [
   { data: "pin", label: "PIN", implemented: true },
-  { data: "password", label: "Password (Soon)", implemented: false },
-  { data: "pattern", label: "Pattern (Soon)", implemented: false },
-  { data: "tap_code", label: "Tap Code (Soon)", implemented: false },
+  { data: "password", label: "Password", implemented: true },
+  { data: "pattern", label: "Pattern", implemented: true },
+  // "tap_code" internally (matches the settings key/type already round-tripped since
+  // the initial release) — labeled "Knock Code" since that's what it actually is: LG's
+  // old lock screen feature, a 2x2 grid tapped in sequence (see KnockCodePad).
+  { data: "tap_code", label: "Knock Code", implemented: true },
   // Unlocks with a sequence of controller button presses (A/B/X/Y, bumpers, triggers,
-  // d-pad), similar to the Deck's own native lock screen's button-combo unlock.
-  { data: "controller_code", label: "Controller Code (Soon)", implemented: false },
+  // d-pad), similar to the Deck's own native lock screen's button-combo unlock. The
+  // Lock Method picker below appends "(Soon)" itself for any unimplemented option.
+  { data: "controller_code", label: "Controller Code", implemented: false },
 ];
+
+// Maps each implemented lock method to the settings.json boolean that says whether its
+// credential has been set (see _public_settings in main.py); add an entry here when a
+// new method's set_/check_ pair lands. Unimplemented methods (e.g. controller_code)
+// fall through to pin_set, same as the settings picker treats them as PIN until then.
+type CredentialSetKey = "pin_set" | "password_set" | "pattern_set" | "tap_code_set";
+const CREDENTIAL_SET_KEYS: Partial<Record<LockMethod, CredentialSetKey>> = {
+  pin: "pin_set",
+  password: "password_set",
+  pattern: "pattern_set",
+  tap_code: "tap_code_set",
+};
+
+// True when the credential for the currently-selected lock method has been set — the
+// gate for showing anything that requires unlocking (the GAMES/PLUGINS/etc. sections,
+// the Decky panel gate, the QAM self-lock prompt).
+function hasCredentialSet(
+  s:
+    | Pick<DeckLockerSettings, "lock_method" | "pin_set" | "password_set" | "pattern_set" | "tap_code_set">
+    | null
+    | undefined
+): boolean {
+  if (!s) return false;
+  const key = CREDENTIAL_SET_KEYS[s.lock_method] ?? "pin_set";
+  return Boolean(s[key]);
+}
+
+// Human-readable label for the currently-selected lock method's credential, used in
+// entry-screen copy ("Enter PIN" / "Enter Password") and error text. Reads from
+// LOCK_METHOD_OPTIONS so the display name has one source of truth.
+function credentialLabel(method: LockMethod): string {
+  return LOCK_METHOD_OPTIONS.find((option) => option.data === method)?.label ?? "PIN";
+}
+
+// Pattern nodes (0-8, each used at most once) round-trip as this joined string —
+// stable, order-preserving, and cheap to hash/compare on the backend the same way a
+// PIN or password string is.
+function sequenceToString(nodes: number[]): string {
+  return nodes.join("-");
+}
+
+// Clears an in-progress entry while it has content, cancels out of the screen once
+// it's already empty — same dual-purpose convention as the PIN keypad's bottom-left
+// key. Shared by the pattern and Knock Code entry screens in PinLockScreen.
+function clearOrCancel<T>(value: T[], setValue: (v: T[]) => void, cancel: () => void) {
+  if (value.length > 0) setValue([]);
+  else cancel();
+}
+
+// Shared "frosted glass" look toggled on by keypad_glass_effect, pattern_glass_effect,
+// and action_button_glass_effect — applied to keypad cells, pattern dots, and the
+// Password/Pattern Cancel/OK button row respectively.
+const FROSTED_GLASS_STYLE = {
+  background: "rgba(255,255,255,0.14)",
+  backdropFilter: "blur(24px) saturate(180%)",
+  WebkitBackdropFilter: "blur(24px) saturate(180%)",
+  border: "1px solid rgba(255,255,255,0.25)",
+};
 
 const getSettings = callable<[], DeckLockerSettings>("get_settings");
 const setGlobalLock = callable<[enabled: boolean], DeckLockerSettings>("set_global_lock");
 const setQamLock = callable<[enabled: boolean], DeckLockerSettings>("set_qam_lock");
 const setCustomization = callable<[updates: Partial<DeckLockerSettings>], DeckLockerSettings>("set_customization");
+const resetAllSettings = callable<[], DeckLockerSettings>("reset_all_settings");
 const setPin = callable<[pin: string], boolean>("set_pin");
 const checkPin = callable<[pin: string], boolean>("check_pin");
+const setPassword = callable<[password: string], boolean>("set_password");
+const checkPassword = callable<[password: string], boolean>("check_password");
+const setPattern = callable<[pattern: string], boolean>("set_pattern");
+const checkPattern = callable<[pattern: string], boolean>("check_pattern");
+const setTapCode = callable<[code: string], boolean>("set_tap_code");
+const checkTapCode = callable<[code: string], boolean>("check_tap_code");
+
+// Dispatches a credential-entry attempt to whichever method's check_ call applies.
+// Falls back to PIN for a not-yet-implemented method — unreachable in practice since
+// LOCK_METHOD_OPTIONS disables picking one before its own case is added here.
+async function checkCredential(method: LockMethod, value: string): Promise<boolean> {
+  if (method === "password") return checkPassword(value);
+  if (method === "pattern") return checkPattern(value);
+  if (method === "tap_code") return checkTapCode(value);
+  return checkPin(value);
+}
 const toggleApp = callable<[app_id: string, locked: boolean], string[]>("toggle_app");
 const togglePluginLock = callable<[plugin_name: string, locked: boolean], string[]>("toggle_plugin_lock");
 const toggleQamTabLock = callable<[tab_name: string, locked: boolean], string[]>("toggle_qam_tab_lock");
@@ -100,9 +204,43 @@ const getLocalHeroArtwork = callable<[app_id: string], string>("get_local_hero_a
 // Cached after the first fetch so lock checks throughout the session can read
 // settings synchronously without an extra IPC round-trip to the Python backend.
 let cachedSettings: DeckLockerSettings | null = null;
+
+// Notifies components that only read cachedSettings during render (not via React
+// state/props) that it just changed, so they know to re-render — plain mutation of a
+// module-level variable is invisible to React on its own. Long-lived components like
+// DeckyPanelPinPrompt (shared by the QAM tab gate, plugin gate, and Main Menu item
+// gate) can sit mounted for a whole session without ever re-rendering on their own
+// after the Lock Method changes elsewhere, which is exactly what left them showing the
+// old method's entry UI even after closing and reopening the QAM — closing/reopening
+// doesn't unmount them, so nothing prompted a fresh read of cachedSettings.lock_method
+// without this.
+const settingsChangeListeners = new Set<() => void>();
+function setCachedSettings(updated: DeckLockerSettings) {
+  // Only lock_method actually needs to wake up listeners today (see the comment
+  // above) — gating on it avoids forcing every listener to re-render on unrelated
+  // settings churn, e.g. a customization slider firing onChange continuously while
+  // dragged. Widen this check if a future listener needs to react to other fields.
+  const lockMethodChanged = cachedSettings?.lock_method !== updated.lock_method;
+  cachedSettings = updated;
+  if (lockMethodChanged) settingsChangeListeners.forEach((listener) => listener());
+}
+// Subscribes a component to cachedSettings changes, forcing a re-render on each one so
+// values derived from cachedSettings during render (e.g. `lockMethod`) stay current
+// even when nothing else about the component would otherwise cause it to re-render.
+function useCachedSettingsVersion(): void {
+  const [, setVersion] = useState(0);
+  useEffect(() => {
+    const listener = () => setVersion((v) => v + 1);
+    settingsChangeListeners.add(listener);
+    return () => {
+      settingsChangeListeners.delete(listener);
+    };
+  }, []);
+}
+
 async function getSettingsCached(): Promise<DeckLockerSettings> {
   const s = await getSettings();
-  cachedSettings = s;
+  setCachedSettings(s);
   return s;
 }
 
@@ -275,6 +413,230 @@ function SetPinModal({ closeModal, onPinSet }: { closeModal?: () => void; onPinS
   );
 }
 
+// Modal for setting or changing the password. Mirrors SetPinModal exactly except it
+// allows any characters (no digit-only filter) — requires at least 4 characters and a
+// matching confirmation entry before saving.
+function SetPasswordModal({ closeModal, onPasswordSet }: { closeModal?: () => void; onPasswordSet?: () => void }) {
+  const [password, setPasswordValue] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const onConfirm = async () => {
+    if (password.length < 4) {
+      setError("Password must be at least 4 characters");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Passwords do not match");
+      return;
+    }
+    await setPassword(password);
+    onPasswordSet?.();
+    closeModal?.();
+  };
+
+  return (
+    <ConfirmModal
+      strTitle="Set Deck Locker Password"
+      strDescription="Enter a password (at least 4 characters) required to launch locked games."
+      onOK={onConfirm}
+      onCancel={closeModal}
+    >
+      <TextField
+        label="Password"
+        value={password}
+        onChange={(e) => {
+          setError("");
+          setPasswordValue(e.target.value);
+        }}
+        bIsPassword={true}
+      />
+      <TextField
+        label="Confirm Password"
+        value={confirmPassword}
+        onChange={(e) => {
+          setError("");
+          setConfirmPassword(e.target.value);
+        }}
+        bIsPassword={true}
+      />
+      {error && <div style={{ color: "#f44336", marginTop: "8px", fontSize: "13px" }}>{error}</div>}
+    </ConfirmModal>
+  );
+}
+
+// Shared state machine behind SetPatternModal and SetKnockCodeModal: both capture a
+// node/cell sequence twice (draw/tap once, then repeat to confirm) and only save it
+// once the two entries match. A real drag-release (PatternPad) or the modal's own OK
+// button (relabeled "Next"/"Save" per stage, for a tap-per-node draw with no drag
+// release to catch) advances the stage or triggers the save/compare. On save it colors
+// the second attempt green/red for a couple seconds (see the pad's status prop) before
+// either closing (match) or clearing the confirm entry for another attempt (mismatch)
+// — same "hold the result, then reset" pacing as the lock screen's own incorrect-PIN
+// shake-and-clear.
+function useTwoStageSequenceCapture({
+  minLength,
+  tooShortError,
+  mismatchError,
+  onSave,
+  onSaved,
+  closeModal,
+}: {
+  minLength: number;
+  tooShortError: string;
+  mismatchError: string;
+  onSave: (sequence: string) => Promise<unknown>;
+  onSaved?: () => void;
+  closeModal?: () => void;
+}) {
+  const [stage, setStage] = useState<"first" | "confirm">("first");
+  const [firstSequence, setFirstSequence] = useState<number[]>([]);
+  const [confirmSequence, setConfirmSequence] = useState<number[]>([]);
+  const [error, setError] = useState("");
+  const [confirmStatus, setConfirmStatus] = useState<"neutral" | "correct" | "incorrect">("neutral");
+  const busy = confirmStatus !== "neutral";
+
+  const activeSequence = stage === "first" ? firstSequence : confirmSequence;
+  const setActiveSequence = stage === "first" ? setFirstSequence : setConfirmSequence;
+
+  const onAdvanceOrSave = async () => {
+    if (busy) return;
+    if (stage === "first") {
+      if (firstSequence.length < minLength) {
+        setError(tooShortError);
+        return;
+      }
+      setError("");
+      setStage("confirm");
+      return;
+    }
+    const matched = sequenceToString(confirmSequence) === sequenceToString(firstSequence);
+    setConfirmStatus(matched ? "correct" : "incorrect");
+    if (matched) {
+      await onSave(sequenceToString(firstSequence));
+      onSaved?.();
+      setTimeout(() => closeModal?.(), 2000);
+    } else {
+      setError(mismatchError);
+      setTimeout(() => {
+        setConfirmSequence([]);
+        setConfirmStatus("neutral");
+        setError("");
+      }, 1500);
+    }
+  };
+
+  return { stage, activeSequence, setActiveSequence, error, confirmStatus, busy, onAdvanceOrSave };
+}
+
+// Modal for setting or changing the pattern. Unlike PIN/Password's two side-by-side
+// fields, a pattern needs the drawing surface to itself, so this uses the shared
+// two-stage capture flow (see useTwoStageSequenceCapture) instead. Clear/Next-Save/
+// Cancel all render as ConfirmModal's own native footer row via its middle-button slot
+// (onMiddleButton/strMiddleButtonText) rather than a custom button stacked in the body
+// — same row, same styling, no hand-rolled footer needed.
+function SetPatternModal({ closeModal, onPatternSet }: { closeModal?: () => void; onPatternSet?: () => void }) {
+  const { stage, activeSequence, setActiveSequence, error, confirmStatus, busy, onAdvanceOrSave } =
+    useTwoStageSequenceCapture({
+      minLength: 4,
+      tooShortError: "Pattern must connect at least 4 dots",
+      mismatchError: "Patterns do not match",
+      onSave: setPattern,
+      onSaved: onPatternSet,
+      closeModal,
+    });
+
+  return (
+    <ConfirmModal
+      strTitle="Set Deck Locker Pattern"
+      strDescription={
+        stage === "first" ? "Draw a pattern connecting at least 4 dots." : "Draw the same pattern again to confirm."
+      }
+      strOKButtonText={stage === "first" ? "Next" : "Save"}
+      onOK={onAdvanceOrSave}
+      bOKDisabled={busy}
+      strMiddleButtonText="Clear"
+      onMiddleButton={() => setActiveSequence([])}
+      bMiddleDisabled={busy}
+      onCancel={closeModal}
+    >
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "12px", marginTop: "16px" }}>
+        <PatternPad
+          key={stage}
+          value={activeSequence}
+          onChange={setActiveSequence}
+          onDragComplete={onAdvanceOrSave}
+          disabled={busy}
+          status={stage === "confirm" ? confirmStatus : "neutral"}
+          useThemeColor={cachedSettings?.pattern_line_theme_color ?? false}
+          transparentLine={cachedSettings?.pattern_line_transparent ?? false}
+          size={64}
+          gap={12}
+          shape={cachedSettings?.pattern_dot_shape ?? "rounded"}
+          cornerRadius={cachedSettings?.pattern_corner_radius ?? 14}
+          glassEffect={cachedSettings?.pattern_glass_effect ?? false}
+        />
+        {error && <div style={{ color: "#f44336", fontSize: "13px" }}>{error}</div>}
+      </div>
+    </ConfirmModal>
+  );
+}
+
+// Modal for setting or changing the Knock Code. Same shared two-stage capture flow
+// (see useTwoStageSequenceCapture) and Clear/Next-Save/Cancel-as-ConfirmModal's-native-
+// footer convention as SetPatternModal — tap a sequence of cells, then tap the same
+// sequence again to confirm, with a green/red result on KnockCodePad itself before
+// either closing (match) or clearing for another attempt.
+function SetKnockCodeModal({ closeModal, onTapCodeSet }: { closeModal?: () => void; onTapCodeSet?: () => void }) {
+  const { stage, activeSequence, setActiveSequence, error, confirmStatus, busy, onAdvanceOrSave } =
+    useTwoStageSequenceCapture({
+      minLength: 4,
+      tooShortError: "Knock Code must be at least 4 taps",
+      mismatchError: "Knock Codes do not match",
+      onSave: setTapCode,
+      onSaved: onTapCodeSet,
+      closeModal,
+    });
+
+  return (
+    <ConfirmModal
+      strTitle="Set Deck Locker Knock Code"
+      strDescription={
+        stage === "first" ? "Tap the cells in a sequence (at least 4 taps)." : "Tap the same sequence again to confirm."
+      }
+      strOKButtonText={stage === "first" ? "Next" : "Save"}
+      onOK={onAdvanceOrSave}
+      bOKDisabled={busy}
+      strMiddleButtonText="Clear"
+      onMiddleButton={() => setActiveSequence([])}
+      bMiddleDisabled={busy}
+      onCancel={closeModal}
+    >
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "16px", marginTop: "16px" }}>
+        <KnockCodePad
+          key={stage}
+          onTap={(index) => setActiveSequence((prev) => [...prev, index])}
+          disabled={busy}
+          status={stage === "confirm" ? confirmStatus : "neutral"}
+          // Always on here regardless of the Customization toggles — setting a code
+          // benefits from clear grid structure no matter what the lock screen itself
+          // is configured to show.
+          showOutline
+          showDividers
+          size={92}
+          gap={17}
+        />
+        <div style={{ display: "flex", gap: "8px", minHeight: "12px" }}>
+          {activeSequence.map((_, i) => (
+            <div key={i} style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#fff" }} />
+          ))}
+        </div>
+        {error && <div style={{ color: "#f44336", fontSize: "13px" }}>{error}</div>}
+      </div>
+    </ConfirmModal>
+  );
+}
+
 // Hides Steam's footer button-hint bar for the lifetime of the calling component.
 // Used by full-screen overlays so Steam's UI chrome doesn't bleed through during
 // PIN entry or re-lock animations.
@@ -336,6 +698,571 @@ function useHeroBackground(appid: string) {
   return { heroBgUri, heroBgSource, setHeroBgSource };
 }
 
+// Whether the browser accepts `value` as a real, single CSS color (as opposed to a
+// gradient/image function, an unresolved token, or empty) — checked by trying to
+// assign it and seeing if it stuck, rather than hand-rolling a color-syntax parser.
+function isCssColor(value: string, doc: Document): boolean {
+  if (!value) return false;
+  const probe = doc.createElement("span");
+  probe.style.color = "";
+  probe.style.color = value;
+  return probe.style.color !== "";
+}
+
+type ThemeAccent = { kind: "color"; value: string } | { kind: "gradient"; angleDeg: number; colors: string[] };
+
+// Splits a CSS value list on top-level commas only — needed for gradient color stops,
+// since a plain split(",") would also break apart the commas inside each stop's own
+// rgba(...)/hsla(...) function.
+function splitTopLevelCommas(value: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of value) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+// Parses a *computed* linear-gradient() value (angle always resolved to plain degrees
+// by getComputedStyle, unlike author-written "to right"/keyword forms) into its angle
+// and color stops, dropping each stop's position (e.g. "50%") — good enough for an
+// evenly-redistributed SVG gradient approximation, not a pixel-exact reproduction.
+function parseLinearGradient(value: string): { angleDeg: number; colors: string[] } | null {
+  const match = value.match(/^linear-gradient\(\s*(-?[\d.]+)deg\s*,\s*(.+)\)$/i);
+  if (!match) return null;
+  const angleDeg = parseFloat(match[1]);
+  const colors = splitTopLevelCommas(match[2])
+    .map((stop) => stop.replace(/\s+-?[\d.]+%\s*$/, "").trim())
+    .filter(Boolean);
+  return colors.length >= 2 ? { angleDeg, colors } : null;
+}
+
+// Converts a CSS gradient angle (0deg = to top, clockwise, per spec) into absolute
+// x1/y1/x2/y2 coordinates spanning a `size`-by-`size` box, for an SVG <linearGradient>
+// using gradientUnits="userSpaceOnUse" — NOT the default objectBoundingBox, which
+// scopes x1/y1/x2/y2 to each individual referencing element's own bounding box rather
+// than the shared canvas. A single <linearGradient> def here is referenced by every
+// dot-to-dot <line>, and a purely horizontal or vertical line has a bounding box with
+// zero height or width — a degenerate box, which makes an objectBoundingBox gradient
+// invalid and the line simply not render (confirmed live: diagonal lines rendered
+// fine, horizontal/vertical ones didn't). userSpaceOnUse coordinates are defined once
+// against the whole canvas instead, so every line — whatever direction — resolves the
+// same shared gradient consistently. This is a standard angle-to-vector approximation
+// — CSS's exact "to corner" geometry also depends on aspect ratio, which doesn't
+// matter here since the pattern grid is square.
+function gradientAngleToSvgVector(angleDeg: number, size: number) {
+  const rad = (angleDeg * Math.PI) / 180;
+  const half = size / 2;
+  return {
+    x1: half - half * Math.sin(rad),
+    y1: half + half * Math.cos(rad),
+    x2: half + half * Math.sin(rad),
+    y2: half - half * Math.cos(rad),
+  };
+}
+
+// Best-effort read of "the current theme's accent color" for pattern_line_theme_color
+// — there's no single CSS variable for this across arbitrary CSS Loader themes (unlike
+// Millennium-style theming, community Deck themes just override specific component
+// classes directly), so this briefly mounts an invisible probe element wearing one of
+// Steam's own shared, commonly-retheming-target component classes (the slider fill
+// behind volume/seek/settings sliders, then the "on" toggle rail) and reads its
+// *computed* ::before background — getComputedStyle does the real cascade resolution
+// (source order, specificity, !important, var() substitution) for free, which a manual
+// stylesheet-rule scan can't replicate correctly (an earlier version of this took the
+// first matching rule in document order, which was Steam's own un-themed default —
+// same specificity, just declared before the theme's override, so it always won the
+// naive scan even though the browser's real cascade picks the theme's rule instead).
+// Returns a real multi-stop gradient descriptor when the theme uses one (some packs,
+// like "Colored Toggles"'s Gradient options, do) rather than collapsing it to a single
+// color — PatternPad renders it as a genuine SVG <linearGradient> for lines and a
+// native CSS gradient for dot fills, not just an approximation of its first stop.
+// Takes `doc` rather than assuming the global `document` — decky content can render
+// inside a different top-level page than where this is called from (QuickAccess,
+// MainMenu, and the main Big Picture window are separate documents, and a theme may
+// only inject its CSS into some of them), so callers pass their own root element's
+// ownerDocument.
+//
+// Deliberately NOT cached: this needs to reflect whatever the user currently has that
+// theme (or theme option, e.g. Colored Toggles' color dropdown) set to, and CSS Loader
+// themes can be re-picked without restarting Steam — a value cached from the first
+// lookup would go stale the moment they change it. The lookup itself is cheap (a
+// handful of getComputedStyle calls on a detached element), so recomputing on every
+// PatternPad mount that asks for it isn't worth trading correctness for.
+function getThemeAccent(doc: Document): ThemeAccent | null {
+  const targetClasses = [
+    gamepadSliderClasses?.SliderTrack,
+    gamepadDialogClasses?.ToggleRail,
+    gamepadSliderClasses?.SliderHandle,
+    gamepadDialogClasses?.Toggle,
+  ].filter(Boolean) as string[];
+
+  let found: ThemeAccent | null = null;
+  try {
+    for (const cls of targetClasses) {
+      const probe = doc.createElement("div");
+      probe.className = cls;
+      probe.style.position = "fixed";
+      probe.style.top = "-9999px";
+      probe.style.left = "-9999px";
+      probe.style.pointerEvents = "none";
+      doc.body.appendChild(probe);
+      const before = doc.defaultView?.getComputedStyle(probe, "::before");
+      const bgColor = before?.backgroundColor ?? "";
+      const bgImage = before?.backgroundImage ?? "";
+      doc.body.removeChild(probe);
+
+      if (bgColor && bgColor !== "rgba(0, 0, 0, 0)" && isCssColor(bgColor, doc)) {
+        found = { kind: "color", value: bgColor };
+        break;
+      }
+      if (bgImage && bgImage !== "none") {
+        const gradient = parseLinearGradient(bgImage);
+        if (gradient) {
+          found = { kind: "gradient", ...gradient };
+          break;
+        }
+        // A gradient type we don't parse (radial/conic) — fall back to its first
+        // color stop as a plain color rather than not theming it at all.
+        const stop = bgImage.match(/#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)/);
+        if (stop && isCssColor(stop[0], doc)) {
+          found = { kind: "color", value: stop[0] };
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("DeckLocker: theme accent lookup failed", e);
+  }
+
+  return found;
+}
+
+// Shared 3x3 drag-to-connect pattern pad — the credential-entry widget for the
+// "pattern" lock method, used by the full-screen PinLockScreen, the compact
+// DeckyPanelPinPrompt, the QAM's own self-lock gate, and SetPatternModal so the
+// pointer/gamepad handling and line-drawing only exist once.
+//
+// Two ways to build a sequence, both writing into the same controlled `value` array:
+// - Drag: press down on a node and move across others while held — a real drag (the
+//   pointer visits a second node before release) calls `onDragComplete` on release,
+//   same as Android's unlock-on-lift behavior.
+// - Tap-per-node (mouse click without dragging, or gamepad A on a focused node): only
+//   adds that one node and waits — lets non-drag input (a controller, or a QAM panel
+//   too small/awkward to drag across) build the same sequence one node at a time
+//   before the caller's own confirm control (an OK button) submits it.
+//
+// Hit-testing is geometric (which third of the pad's box the pointer is over), not
+// element-based, since the SVG line overlay sits on top of the dots and would
+// otherwise intercept elementFromPoint hits.
+function PatternPad({
+  value,
+  onChange,
+  onDragComplete,
+  disabled,
+  status = "neutral",
+  useThemeColor = false,
+  transparentLine = false,
+  size = 72,
+  gap = 14,
+  shape = "rounded",
+  cornerRadius = 14,
+  glassEffect = false,
+}: {
+  value: number[];
+  onChange: (nodes: number[]) => void;
+  onDragComplete?: (nodes: number[]) => void;
+  disabled?: boolean;
+  // Recolors the selected dots/lines green ("correct") or red ("incorrect") instead of
+  // white — used by SetPatternModal to show whether the confirm draw matched. Takes
+  // priority over useThemeColor and transparentLine — a match/mismatch result is a
+  // functional signal, not a decorative choice.
+  status?: "neutral" | "correct" | "incorrect";
+  // Uses the current theme's slider/progress accent color (see getThemeAccent) for the
+  // dots/lines instead of plain white, while status is "neutral" — a real multi-stop
+  // gradient renders as one, not just its first color.
+  useThemeColor?: boolean;
+  // Hides the connecting line between dots entirely while status is "neutral" — only
+  // the dots themselves show the drawn sequence.
+  transparentLine?: boolean;
+  size?: number;
+  gap?: number;
+  // "none" draws bare dots with no surrounding cell background/border — cornerRadius
+  // and glassEffect have nothing to apply to in that case.
+  shape?: "square" | "rounded" | "circle" | "none";
+  cornerRadius?: number;
+  glassEffect?: boolean;
+}) {
+  const containerRef = useRef<SVGSVGElement | null>(null);
+  const draggingRef = useRef(false);
+  const draggedMultipleRef = useRef(false);
+  const [focusedNode, setFocusedNode] = useState<number | null>(null);
+  // Resolved lazily once mounted (not synchronously during render) since it needs this
+  // instance's own ownerDocument — decky content can render inside a different
+  // top-level page than the one holding `document` globally (see getThemeAccent).
+  const [themeAccent, setThemeAccent] = useState<ThemeAccent | null>(null);
+  useEffect(() => {
+    if (!useThemeColor) return;
+    const doc = containerRef.current?.ownerDocument ?? document;
+    setThemeAccent(getThemeAccent(doc));
+  }, [useThemeColor]);
+  // A stable id for this instance's <linearGradient> def — SVG gradient references are
+  // per-document by id, so each mounted PatternPad needs its own to avoid colliding
+  // with another instance's (e.g. the lock screen behind an open SetPatternModal).
+  const gradientIdRef = useRef(`decklocker-pattern-gradient-${Math.random().toString(36).slice(2)}`);
+
+  const getNodeAtClientPoint = (x: number, y: number): number | null => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null;
+    const col = Math.min(2, Math.max(0, Math.floor(((x - rect.left) / rect.width) * 3)));
+    const row = Math.min(2, Math.max(0, Math.floor(((y - rect.top) / rect.height) * 3)));
+    return row * 3 + col;
+  };
+
+  const addNode = (index: number) => {
+    if (disabled || value.includes(index)) return;
+    onChange([...value, index]);
+  };
+
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const idx = getNodeAtClientPoint(e.clientX, e.clientY);
+    if (idx === null) return;
+    containerRef.current?.setPointerCapture?.(e.pointerId);
+    draggingRef.current = true;
+    draggedMultipleRef.current = false;
+    addNode(idx);
+  };
+
+  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!draggingRef.current || disabled) return;
+    const idx = getNodeAtClientPoint(e.clientX, e.clientY);
+    if (idx === null || value.includes(idx)) return;
+    draggedMultipleRef.current = true;
+    onChange([...value, idx]);
+  };
+
+  const endDrag = () => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    if (draggedMultipleRef.current && value.length > 0) onDragComplete?.(value);
+  };
+
+  const dotSize = Math.round(size * 0.32);
+  const gridPx = size * 3 + gap * 2;
+  const keyBorderRadius = shape === "circle" ? "50%" : shape === "square" ? "0px" : `${cornerRadius}px`;
+  const cellBg = shape === "none" ? {} : glassEffect ? FROSTED_GLASS_STYLE : { background: "rgba(255,255,255,0.06)" };
+
+  const centerOf = (index: number) => {
+    const row = Math.floor(index / 3);
+    const col = index % 3;
+    return { x: col * (size + gap) + size / 2, y: row * (size + gap) + size / 2 };
+  };
+
+  const isNeutral = status === "neutral";
+  const themeGradient = isNeutral && useThemeColor && themeAccent?.kind === "gradient" ? themeAccent : null;
+  const themeGradientCss = themeGradient ? `linear-gradient(${themeGradient.angleDeg}deg, ${themeGradient.colors.join(", ")})` : null;
+  const neutralColor = useThemeColor
+    ? themeAccent?.kind === "color"
+      ? themeAccent.value
+      : themeGradient
+      ? themeGradient.colors[0]
+      : "#fff"
+    : "#fff";
+  const statusColor = status === "correct" ? "#4caf50" : status === "incorrect" ? "#f44336" : neutralColor;
+  // transparentLine only hides the connecting line while neutral — an incorrect/correct
+  // result is still a functional signal and stays visible on the line too.
+  const lineStroke = !isNeutral ? statusColor : transparentLine ? "transparent" : themeGradient ? `url(#${gradientIdRef.current})` : neutralColor;
+  const dotFillCss = !isNeutral ? statusColor : themeGradientCss ?? neutralColor;
+
+  return (
+    // Focusable (not a plain div) so Steam's spatial nav actually registers this as a
+    // grid and moves the D-pad between the 9 dot Focusables below — same fix as the
+    // numeric keypad's own grid and the Cancel/OK row (a plain div here left the dots
+    // unreachable by D-pad, gamepad-focusable only by accident via tab order).
+    <Focusable
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      style={{
+        position: "relative",
+        width: `${gridPx}px`,
+        height: `${gridPx}px`,
+        display: "grid",
+        gridTemplateColumns: `repeat(3, ${size}px)`,
+        gridTemplateRows: `repeat(3, ${size}px)`,
+        gap: `${gap}px`,
+        touchAction: "none",
+      }}
+    >
+      {/* containerRef lives on this plain <svg>, not the Focusable above, for
+          measurement/pointer-capture and to resolve the right document for
+          getThemeAccent — Focusable is pulled dynamically from Steam's own
+          runtime (like TextField) and isn't used anywhere else in this codebase with a
+          ref, so its ref-forwarding isn't something to depend on; a real intrinsic
+          element is. Same box (absolute, inset 0) as the Focusable, so its rect is
+          equivalent for hit-testing, and pointer capture set here still bubbles the
+          resulting move/up events up to the Focusable's own handlers above. */}
+      <svg
+        ref={containerRef}
+        width={gridPx}
+        height={gridPx}
+        style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+      >
+        {themeGradient && (
+          <defs>
+            <linearGradient
+              id={gradientIdRef.current}
+              gradientUnits="userSpaceOnUse"
+              {...gradientAngleToSvgVector(themeGradient.angleDeg, gridPx)}
+            >
+              {themeGradient.colors.map((color, i) => (
+                <stop key={i} offset={`${(i / (themeGradient.colors.length - 1)) * 100}%`} stopColor={color} />
+              ))}
+            </linearGradient>
+          </defs>
+        )}
+        {value.slice(1).map((node, i) => {
+          const from = centerOf(value[i]);
+          const to = centerOf(node);
+          return (
+            <line
+              key={node}
+              x1={from.x}
+              y1={from.y}
+              x2={to.x}
+              y2={to.y}
+              stroke={lineStroke}
+              strokeWidth={4}
+              strokeLinecap="round"
+              opacity={0.85}
+            />
+          );
+        })}
+      </svg>
+      {Array.from({ length: 9 }).map((_, index) => {
+        const selected = value.includes(index);
+        return (
+          <Focusable
+            key={index}
+            onGamepadFocus={() => setFocusedNode(index)}
+            onGamepadBlur={() => setFocusedNode((prev) => (prev === index ? null : prev))}
+            onActivate={() => addNode(index)}
+            style={{
+              width: `${size}px`,
+              height: `${size}px`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: keyBorderRadius,
+              boxSizing: "border-box",
+              overflow: "hidden",
+              ...cellBg,
+            }}
+          >
+            <div
+              style={{
+                width: `${dotSize}px`,
+                height: `${dotSize}px`,
+                borderRadius: "50%",
+                boxSizing: "border-box",
+                border: selected
+                  ? `2px solid ${statusColor}`
+                  : focusedNode === index
+                  ? "2px solid #fff"
+                  : "2px solid rgba(255,255,255,0.4)",
+                background: selected ? dotFillCss : "transparent",
+              }}
+            />
+          </Focusable>
+        );
+      })}
+    </Focusable>
+  );
+}
+
+// Shared Knock Code pad — LG's old lock screen feature: a 2x2 grid of blank cells,
+// tapped in sequence (repeats of the same cell allowed, unlike Pattern's no-repeat
+// dots — nothing here tracks which cells are "already used"). Used by the full-screen
+// PinLockScreen, the compact DeckyPanelPinPrompt, the QAM's own self-lock gate, and
+// SetKnockCodeModal — each caller owns the actual tap sequence (number[], 0-3 per
+// tap) and gets an onTap(index) callback here. The sequence itself round-trips via
+// sequenceToString, same as Pattern.
+//
+// Deliberately minimal customization surface (see tap_code_show_outline/
+// tap_code_show_dividers in Customization): no per-cell background, shape, or
+// outline — a cell is just a plain transparent tap target — the ONLY visible chrome
+// is one outline around the whole grid and, optionally, divider lines splitting it
+// into 4 quadrants.
+function KnockCodePad({
+  onTap,
+  disabled,
+  status = "neutral",
+  showOutline = true,
+  showDividers = false,
+  fluid = false,
+  size = 80,
+  gap = 14,
+}: {
+  onTap: (index: number) => void;
+  disabled?: boolean;
+  // Recolors the outline around the whole grid green ("correct") or red
+  // ("incorrect") — used by SetKnockCodeModal to show whether the confirm tap
+  // sequence matched. No per-cell coloring, since which cells were tapped isn't
+  // shown persistently in the first place (repeats make that ambiguous). Shows even
+  // when showOutline is off — a match/mismatch result is a functional signal, not a
+  // decorative choice.
+  status?: "neutral" | "correct" | "incorrect";
+  showOutline?: boolean;
+  showDividers?: boolean;
+  // Fills 100% of the parent's width — the same technique the Cancel/OK row below it
+  // already uses — instead of a fixed 2-column pixel grid. A 2-column grid at the same
+  // per-cell size as Pattern's 3-column one is inherently narrower, so matching
+  // Pattern's actual footprint means matching its *container* width, not its cell
+  // size. Height then comes from a 1:1 aspect-ratio on the whole box (so it stays
+  // square whatever that width actually renders as, e.g. the compact QAM panel's own
+  // width) rather than from `size`, which fluid mode ignores.
+  fluid?: boolean;
+  size?: number;
+  gap?: number;
+}) {
+  const tap = (index: number) => {
+    if (disabled) return;
+    onTap(index);
+  };
+
+  const outlineColor = status === "correct" ? "#4caf50" : status === "incorrect" ? "#f44336" : "rgba(255,255,255,0.4)";
+  const borderStyle = status !== "neutral" || showOutline ? `2px solid ${outlineColor}` : "2px solid transparent";
+
+  return (
+    <Focusable
+      style={{
+        position: "relative",
+        display: "grid",
+        width: fluid ? "100%" : undefined,
+        aspectRatio: fluid ? "1 / 1" : undefined,
+        gridTemplateColumns: fluid ? "repeat(2, 1fr)" : `repeat(2, ${size}px)`,
+        gridTemplateRows: fluid ? "repeat(2, 1fr)" : `repeat(2, ${size}px)`,
+        gap: `${gap}px`,
+        padding: `${gap}px`,
+        boxSizing: fluid ? "border-box" : "content-box",
+        border: borderStyle,
+        borderRadius: "16px",
+      }}
+    >
+      {showDividers && (
+        <>
+          <div
+            style={{
+              position: "absolute",
+              left: "50%",
+              top: `${gap}px`,
+              bottom: `${gap}px`,
+              width: "1px",
+              background: "rgba(255,255,255,0.3)",
+              transform: "translateX(-50%)",
+              pointerEvents: "none",
+            }}
+          />
+          <div
+            style={{
+              position: "absolute",
+              top: "50%",
+              left: `${gap}px`,
+              right: `${gap}px`,
+              height: "1px",
+              background: "rgba(255,255,255,0.3)",
+              transform: "translateY(-50%)",
+              pointerEvents: "none",
+            }}
+          />
+        </>
+      )}
+      {Array.from({ length: 4 }).map((_, index) => (
+        <Focusable
+          key={index}
+          onActivate={() => tap(index)}
+          style={{
+            width: fluid ? "100%" : `${size}px`,
+            height: fluid ? "100%" : `${size}px`,
+            // Grid items default to min-width/min-height: auto, refusing to shrink
+            // below their content's natural size — Steam's own DialogButton has an
+            // intrinsic minimum width, so at a narrow enough container (fluid mode,
+            // shrunk 15% for Knock Code) each cell overflowed past its 1fr track and
+            // past the outline/dividers around it, rather than actually shrinking to
+            // fit. Same fix as the Cancel/OK row elsewhere in this file.
+            minWidth: 0,
+            minHeight: 0,
+            overflow: "hidden",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <DialogButton
+            onClick={() => tap(index)}
+            disabled={disabled}
+            style={{ width: "100%", height: "100%", minWidth: 0, boxSizing: "border-box", background: "transparent", border: "none" }}
+          />
+        </Focusable>
+      ))}
+    </Focusable>
+  );
+}
+
+// Shared Cancel/OK button row used by PinLockScreen's Password, Pattern, and Knock
+// Code variants below (PIN's own Cancel/OK are keypad cells, not this row). Pattern
+// and Knock Code repurpose the Cancel button as "Clear" while their entry has content
+// (see onPatternClearOrCancel/onKnockClearOrCancel) by passing that in as cancelLabel.
+// glassStyle is omitted for Knock Code — action_button_glass_effect intentionally
+// doesn't apply there (see that setting's own comment on DeckLockerSettings: Knock
+// Code's customization is deliberately minimal).
+//
+// Grid (not flex: 1 children) so minWidth: 0 actually takes — flex items default to
+// min-width: auto and refuse to shrink below their own content's natural width no
+// matter what the row's own width says, which is why an earlier flex version stayed
+// pinned at DialogButton's ~160px each and overflowed past the field's edge regardless
+// of the row's explicit width (confirmed by inspecting the live DOM: the row's own
+// inline width WAS right, the buttons just ignored it). Each button gets its own
+// nested Focusable, same as every keypad key in PinLockScreen, so gamepad left/right
+// lands between them correctly instead of skipping past this row.
+function CancelOkRow({
+  cancelLabel,
+  onCancel,
+  onOk,
+  glassStyle,
+}: {
+  cancelLabel: string;
+  onCancel: () => void;
+  onOk: () => void;
+  glassStyle?: object;
+}) {
+  return (
+    <Focusable style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", width: "100%" }}>
+      <Focusable style={{ minWidth: 0 }}>
+        <DialogButton onClick={onCancel} style={{ width: "100%", minWidth: 0, boxSizing: "border-box", ...glassStyle }}>
+          {cancelLabel}
+        </DialogButton>
+      </Focusable>
+      <Focusable style={{ minWidth: 0 }}>
+        <DialogButton onClick={onOk} style={{ width: "100%", minWidth: 0, boxSizing: "border-box", ...glassStyle }}>
+          OK
+        </DialogButton>
+      </Focusable>
+    </Focusable>
+  );
+}
+
 // Full-screen PIN entry overlay shown in place of the real game page while locked.
 // Left panel: PIN dot display and 3×4 numeric keypad.
 // Right panel: game cover art with a local → CDN fallback chain, plus game title.
@@ -362,9 +1289,73 @@ function PinLockScreen({
   libraryMode?: boolean;
 }) {
   const [digits, setDigits] = useState<string[]>([]);
+  // Only used when lockMethod is "password" — the numeric keypad above stays PIN-only,
+  // this is the parallel text-entry value for the password variant of this same screen
+  // (see the isPassword branch below).
+  const [passwordValue, setPasswordValue] = useState("");
+  const passwordFieldWrapperRef = useRef<HTMLDivElement | null>(null);
+  // Only used when lockMethod is "pattern" — the sequence of dot indices (0-8) drawn
+  // so far, in order. See the isPattern branch below and PatternPad.
+  const [patternNodes, setPatternNodes] = useState<number[]>([]);
+  // Only used when lockMethod is "tap_code" — the sequence of cell indices (0-3)
+  // tapped so far, in order, repeats allowed. See the isTapCode branch below and
+  // KnockCodePad.
+  const [knockSequence, setKnockSequence] = useState<number[]>([]);
   const [focusedKeyKey, setFocusedKeyKey] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   useHideSteamFooter(rootRef);
+
+  const lockMethod = cachedSettings?.lock_method ?? "pin";
+  const isPassword = lockMethod === "password";
+  const isPattern = lockMethod === "pattern";
+  const isTapCode = lockMethod === "tap_code";
+  const enteredLength = isPassword
+    ? passwordValue.length
+    : isPattern
+    ? patternNodes.length
+    : isTapCode
+    ? knockSequence.length
+    : digits.length;
+
+  // Hides the real typed characters (bIsPassword doesn't actually mask text in Steam's
+  // UI) so the dot indicator below is the only thing visibly showing password length —
+  // same technique as DeckyPanelPinPrompt's PIN field. textAlign is this screen's own
+  // addition (not applied to DeckyPanelPinPrompt's field) — centers the dot overlay
+  // over the field the same way this full-screen layout centers everything else.
+  useEffect(() => {
+    if (!isPassword) return;
+    const input = passwordFieldWrapperRef.current?.querySelector("input") as HTMLInputElement | null;
+    if (input) {
+      input.style.color = "transparent";
+      input.style.caretColor = "transparent";
+      (input.style as any).WebkitTextFillColor = "transparent";
+      input.style.textAlign = "center";
+    }
+  }, [isPassword]);
+
+
+  // Steam's on-screen keyboard (id "virtual keyboard") renders correctly and still
+  // takes input while this is up, but visually ends up UNDER this screen's own
+  // zIndex: 999999 backdrop — chosen to sit above everything else on the page, which
+  // the keyboard apparently doesn't clear. Watched via MutationObserver (rather than a
+  // one-time lookup) since the keyboard mounts asynchronously when the field gains
+  // focus, well after this component's own mount. Bumped one above our own backdrop,
+  // not to some arbitrarily larger number, so it stays correctly under anything else
+  // that legitimately needs to sit above this whole screen.
+  useEffect(() => {
+    if (!isPassword) return;
+    const doc = rootRef.current?.ownerDocument;
+    const view = doc?.defaultView;
+    if (!doc || !view) return;
+    const applyKeyboardZIndex = () => {
+      const kb = doc.getElementById("virtual keyboard") as HTMLElement | null;
+      if (kb && kb.style.zIndex !== "1000000") kb.style.zIndex = "1000000";
+    };
+    applyKeyboardZIndex();
+    const observer = new view.MutationObserver(applyKeyboardZIndex);
+    observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["style"] });
+    return () => observer.disconnect();
+  }, [isPassword]);
 
   const [error, setError] = useState("");
   const [pinStatus, setPinStatus] = useState<"neutral" | "correct" | "incorrect">("neutral");
@@ -413,9 +1404,16 @@ function PinLockScreen({
   };
 
   const onOk = async () => {
-    if (digits.length === 0 || checking || pinStatus === "incorrect") return;
+    if (enteredLength === 0 || checking || pinStatus === "incorrect") return;
     setChecking(true);
-    const ok = await checkPin(digits.join(""));
+    const value = isPassword
+      ? passwordValue
+      : isPattern
+      ? sequenceToString(patternNodes)
+      : isTapCode
+      ? sequenceToString(knockSequence)
+      : digits.join("");
+    const ok = await checkCredential(lockMethod, value);
     setChecking(false);
     if (ok) {
       playUnlockSound();
@@ -425,15 +1423,49 @@ function PinLockScreen({
       closeModal?.();
       onDismiss?.();
     } else {
-      setError("Incorrect PIN");
+      setError(`Incorrect ${credentialLabel(lockMethod)}`);
       setPinStatus("incorrect");
       setTimeout(() => {
         setPinStatus("neutral");
         setError("");
         setDigits([]);
+        setPasswordValue("");
+        setPatternNodes([]);
+        setKnockSequence([]);
       }, 2000);
     }
   };
+
+  const onPasswordChange = (next: string) => {
+    if (checking || pinStatus === "incorrect") return;
+    setError("");
+    setPasswordValue(next);
+  };
+
+  const onPatternChange = (nodes: number[]) => {
+    if (checking || pinStatus === "incorrect") return;
+    setError("");
+    setPatternNodes(nodes);
+  };
+
+  // A real drag gesture submits on release, same as Android — tap-per-node input
+  // (gamepad, or a click without dragging) waits for the explicit OK button instead.
+  const onPatternDragComplete = () => {
+    onOk();
+  };
+
+  // Clears the in-progress pattern while any nodes are selected, cancels out of the
+  // screen once it's already empty (see clearOrCancel).
+  const onPatternClearOrCancel = () => clearOrCancel(patternNodes, setPatternNodes, onCancel);
+
+  const onKnockTap = (index: number) => {
+    if (checking || pinStatus === "incorrect") return;
+    setError("");
+    setKnockSequence((prev) => [...prev, index]);
+  };
+
+  // Same dual-purpose convention as onPatternClearOrCancel above.
+  const onKnockClearOrCancel = () => clearOrCancel(knockSequence, setKnockSequence, onCancel);
 
   const onCancel = () => {
     if (!libraryMode) terminateAppAggressively(appid);
@@ -458,14 +1490,13 @@ function PinLockScreen({
   const hideGameArt = cachedSettings?.hide_game_art ?? false;
   // Shared background applied to keypad cells and the art placeholder so they match visually.
   const panelBg = glassEffect
-    ? {
-        background: "rgba(255,255,255,0.14)",
-        backdropFilter: "blur(24px) saturate(180%)",
-        WebkitBackdropFilter: "blur(24px) saturate(180%)",
-        border: "1px solid rgba(255,255,255,0.25)",
-        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.3)",
-      }
+    ? { ...FROSTED_GLASS_STYLE, boxShadow: "inset 0 1px 1px rgba(255,255,255,0.3)" }
     : { background: "rgba(255,255,255,0.06)" };
+
+  // Applied to Password's and Pattern's own Cancel/OK DialogButtons — PIN's own
+  // Cancel/OK are keypad cells and already get panelBg above, but Password/Pattern's
+  // dedicated button row otherwise renders as Steam's plain flat DialogButton.
+  const actionButtonGlassStyle = cachedSettings?.action_button_glass_effect ? FROSTED_GLASS_STYLE : {};
 
   const keypadShape = cachedSettings?.keypad_shape ?? "rounded";
   // Circle shape shrinks the visible cell within its grid slot (same ~78% ratio as the
@@ -474,6 +1505,11 @@ function PinLockScreen({
   const circleKeySize = Math.round(keySize * (72 / 92));
   const keyBorderRadius =
     keypadShape === "circle" ? "50%" : keypadShape === "square" ? "0px" : `${cachedSettings?.keypad_corner_radius ?? 14}px`;
+
+  // Knock Code's own container — 15% narrower than Password/Pattern's. Height comes
+  // from KnockCodePad's own 1:1 aspect-ratio in fluid mode, not a computed size here.
+  const knockContainerWidth = Math.round((keySize * 3 + 28) * 1.15 * 0.85);
+  const knockGap = 17;
 
   // Digit font size is user-adjustable; the smaller hint labels (CANCEL/OK) and the
   // backspace icon scale proportionally so the keypad stays visually balanced.
@@ -558,7 +1594,8 @@ function PinLockScreen({
         />
       )}
 
-      {/* Left panel: status text, PIN dot indicator, and numeric keypad grid. */}
+      {/* Left panel: status text, credential-length dot indicator, and the numeric
+          keypad grid (PIN) or text field + buttons (Password). */}
       <div
         style={{
           width: hideGameArt ? "auto" : "50%",
@@ -595,35 +1632,182 @@ function PinLockScreen({
               </span>
             </>
           ) : (
-            error || "Enter PIN"
+            error || `Enter ${credentialLabel(lockMethod)}`
           )}
         </div>
 
-        <div
-          style={{
-            display: "flex",
-            gap: "10px",
-            marginBottom: "24px",
-            minHeight: "16px",
-            animation: pinStatus === "incorrect" ? "decklocker-shake 0.4s ease-in-out" : undefined,
-          }}
-        >
-          {digits.length === 0 && <div style={{ width: "14px", height: "14px" }} />}
-          {digits.map((_, i) => (
-            <div
-              key={i}
-              style={{
-                width: "14px",
-                height: "14px",
-                borderRadius: "50%",
-                background: pinStatus === "correct" ? "#4caf50" : pinStatus === "incorrect" ? "#f44336" : "#fff",
-              }}
-            />
-          ))}
-        </div>
+        {/* Password's own field shows its own dot overlay, and Pattern's own grid shows
+            selection via filled/connected dots — this shared row is the PIN keypad's
+            only length indicator, so it's skipped for both to avoid double-counting. */}
+        {!isPassword && !isPattern && (
+          <div
+            style={{
+              display: "flex",
+              gap: "10px",
+              // Knock Code sits noticeably closer below this row than PIN's numeric
+              // grid does — the grid itself already reads as a distinct block thanks
+              // to its own outline, so it doesn't need as much breathing room above it.
+              marginBottom: isTapCode ? "8px" : "24px",
+              minHeight: "16px",
+              animation: pinStatus === "incorrect" ? "decklocker-shake 0.4s ease-in-out" : undefined,
+            }}
+          >
+            {enteredLength === 0 && <div style={{ width: "14px", height: "14px" }} />}
+            {Array.from({ length: enteredLength }).map((_, i) => (
+              <div
+                key={i}
+                style={{
+                  width: "14px",
+                  height: "14px",
+                  borderRadius: "50%",
+                  background: pinStatus === "correct" ? "#4caf50" : pinStatus === "incorrect" ? "#f44336" : "#fff",
+                }}
+              />
+            ))}
+          </div>
+        )}
 
-        {/* Single flat Focusable grid so Steam's spatial nav moves between keys
-            correctly without jumping to the first item of the next row. */}
+        {isPassword ? (
+          // Password variant: a hidden-text field (dots overlaid on the field itself
+          // show length — no separate dot row, see above) plus explicit Cancel/OK
+          // buttons in place of the numeric keypad grid. This container is sized 15%
+          // past the keypad's own footprint (keySize * 3 + 28) — a password field reads
+          // as cramped at the same width the 3-column digit grid needs. TextField fills
+          // 100% of this container on its own (confirmed live), so Cancel/OK below are
+          // just given the same 100% rather than a value read off the field's own
+          // rendered box — reading getBoundingClientRect() here previously caught the
+          // field mid-way through its modal entrance scale animation and froze that
+          // shrunken width in state, since a pure CSS transform never fires a
+          // ResizeObserver (the layout box itself never changes size, only its painted
+          // one) — that's exactly what left Cancel+OK narrower than the field.
+          <Focusable
+            onCancelButton={onCancel}
+            onSecondaryButton={onOk}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+              marginTop: "6px",
+              width: `${Math.round((keySize * 3 + 28) * 1.15)}px`,
+            }}
+          >
+            <div ref={passwordFieldWrapperRef} style={{ position: "relative" }}>
+              {/* Plain TextField, same as DeckyPanelPinPrompt's field — no extra
+                  wrapping Focusable. An earlier attempt wrapped this in its own nested
+                  Focusable to try to force gamepad-nav focus onto the input, but Steam's
+                  own gamepad-nav periodically re-asserts focus onto ITS OWN Focusable
+                  landing target, which blurred the real <input> a couple of seconds in
+                  and dismissed the on-screen keyboard mid-type. Matching the compact
+                  field's plain (unwrapped) approach avoids that extra Focusable
+                  registration entirely. */}
+              <TextField
+                value={passwordValue}
+                onChange={(e) => onPasswordChange(e.target.value)}
+                bIsPassword={true}
+                focusOnMount={true}
+              />
+              {/* Same dot overlay as DeckyPanelPinPrompt's field, centered instead of
+                  left-aligned — this screen's own variant, not a change to that
+                  component. */}
+              {passwordValue.length > 0 && (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: "6px",
+                    pointerEvents: "none",
+                    mixBlendMode: "difference",
+                  }}
+                >
+                  {passwordValue.split("").map((_, i) => (
+                    <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
+                  ))}
+                </div>
+              )}
+            </div>
+            <CancelOkRow cancelLabel="Cancel" onCancel={onCancel} onOk={onOk} glassStyle={actionButtonGlassStyle} />
+          </Focusable>
+        ) : isPattern ? (
+          // Pattern variant: the drag-to-connect PatternPad in place of the numeric
+          // keypad, plus the same Clear/Cancel-and-OK row as Password — Clear instead of
+          // a lone Cancel since a mis-drawn pattern is more naturally undone by wiping
+          // the whole grid than by removing one node at a time (see
+          // onPatternClearOrCancel, the same dual-purpose convention as the PIN keypad's
+          // own bottom-left key).
+          <Focusable
+            onCancelButton={onPatternClearOrCancel}
+            onSecondaryButton={onOk}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: "16px",
+              marginTop: "6px",
+            }}
+          >
+            <PatternPad
+              value={patternNodes}
+              onChange={onPatternChange}
+              onDragComplete={onPatternDragComplete}
+              disabled={checking || pinStatus === "incorrect"}
+              useThemeColor={cachedSettings?.pattern_line_theme_color ?? false}
+              transparentLine={cachedSettings?.pattern_line_transparent ?? false}
+              size={cachedSettings?.pattern_dot_size ?? 72}
+              gap={14}
+              shape={cachedSettings?.pattern_dot_shape ?? "rounded"}
+              cornerRadius={cachedSettings?.pattern_corner_radius ?? 14}
+              glassEffect={cachedSettings?.pattern_glass_effect ?? false}
+            />
+            <CancelOkRow
+              cancelLabel={patternNodes.length > 0 ? "Clear" : "Cancel"}
+              onCancel={onPatternClearOrCancel}
+              onOk={onOk}
+              glassStyle={actionButtonGlassStyle}
+            />
+          </Focusable>
+        ) : isTapCode ? (
+          // Knock Code variant: the 2x2 KnockCodePad grid in place of the numeric
+          // keypad/pattern grid, plus the same Clear/Cancel-and-OK row as Pattern —
+          // Clear wipes the tap sequence built up so far (see onKnockClearOrCancel,
+          // the same dual-purpose convention as the PIN keypad's own bottom-left key).
+          <Focusable
+            onCancelButton={onKnockClearOrCancel}
+            onSecondaryButton={onOk}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: "16px",
+              marginTop: "6px",
+              // 15% narrower than Password/Pattern's own container — both the
+              // Cancel/OK row and the KnockCodePad grid (fluid, width:100% of this)
+              // stay matched to each other since they're sized off this same width.
+              width: `${knockContainerWidth}px`,
+            }}
+          >
+            <KnockCodePad
+              onTap={onKnockTap}
+              disabled={checking || pinStatus === "incorrect"}
+              showOutline={cachedSettings?.tap_code_show_outline ?? true}
+              showDividers={cachedSettings?.tap_code_show_dividers ?? false}
+              fluid
+              gap={knockGap}
+            />
+            <CancelOkRow
+              cancelLabel={knockSequence.length > 0 ? "Clear" : "Cancel"}
+              onCancel={onKnockClearOrCancel}
+              onOk={onOk}
+            />
+          </Focusable>
+        ) : (
+        /* Single flat Focusable grid so Steam's spatial nav moves between keys
+            correctly without jumping to the first item of the next row. */
         <Focusable
           onCancelButton={onBottomLeftKey}
           onSecondaryButton={onOk}
@@ -713,6 +1897,7 @@ function PinLockScreen({
             </div>
           ))}
         </Focusable>
+        )}
       </div>
 
       {/* Right panel: game cover art (local → capsule CDN → header CDN) and title. */}
@@ -826,6 +2011,149 @@ let knownTabPanelWidthPx: number | null = null;
 // Simple text-field-and-button PIN prompt, same style as the "Lock This Plugin" gate —
 // as opposed to PinLockScreen's full numeric keypad, which doesn't fit well substituted
 // into the QAM's own (narrower) panel area alongside the rest of the QAM's tabs.
+// Compact "Enter <credential>" entry UI shared by DeckyPanelPinPrompt (QAM tab gate,
+// plugin gate, Main Menu item gate) and the QAM self-lock gate in Content(): a length-
+// feedback dot row (Knock Code only), then the method's own input — PatternPad,
+// KnockCodePad, or a masked TextField with a dot overlay showing entered length (the
+// dots use mix-blend-mode: difference instead of a fixed background color — Steam's
+// native focus style turns the input's background white, and a hardcoded dark
+// background would both fight that and drift from whatever theme is active; a
+// difference blend stays visible against light or dark automatically).
+function CredentialCompactEntry({
+  lockMethod,
+  pin,
+  onPinChange,
+  pattern,
+  onPatternChange,
+  onPatternSubmit,
+  patternSettings,
+  knock,
+  onKnockTap,
+  knockSettings,
+}: {
+  lockMethod: LockMethod;
+  pin: string;
+  onPinChange: (value: string) => void;
+  pattern: number[];
+  onPatternChange: (nodes: number[]) => void;
+  onPatternSubmit: () => void;
+  patternSettings: {
+    lineThemeColor: boolean;
+    lineTransparent: boolean;
+    dotShape: "square" | "rounded" | "circle" | "none";
+    cornerRadius: number;
+    glassEffect: boolean;
+  };
+  knock: number[];
+  onKnockTap: (index: number) => void;
+  knockSettings: { showOutline: boolean; showDividers: boolean };
+}) {
+  const isPattern = lockMethod === "pattern";
+  const isTapCode = lockMethod === "tap_code";
+  const isPassword = lockMethod === "password";
+  const pinWrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // Hides the real typed characters (bIsPassword doesn't actually mask text in Steam's
+  // UI) so the dot overlay below is the only thing visibly showing entry length.
+  useEffect(() => {
+    const input = pinWrapperRef.current?.querySelector("input") as HTMLInputElement | null;
+    if (input) {
+      input.style.color = "transparent";
+      input.style.caretColor = "transparent";
+      (input.style as any).WebkitTextFillColor = "transparent";
+    }
+  }, [pin]);
+
+  return (
+    <>
+      {/* Knock Code cells show no persistent fill (see KnockCodePad), so this is the
+          only length feedback in this compact view — the full lock screen already gets
+          an equivalent row for free via its shared PIN-style indicator. */}
+      {isTapCode && (
+        <PanelSectionRow>
+          <div style={{ display: "flex", justifyContent: "center", gap: "6px", minHeight: "10px", marginTop: "8px" }}>
+            {knock.map((_, i) => (
+              <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
+            ))}
+          </div>
+        </PanelSectionRow>
+      )}
+      {isPattern ? (
+        <PanelSectionRow>
+          <div style={{ display: "flex", justifyContent: "center", marginTop: "12px" }}>
+            <PatternPad
+              value={pattern}
+              onChange={onPatternChange}
+              onDragComplete={onPatternSubmit}
+              useThemeColor={patternSettings.lineThemeColor}
+              transparentLine={patternSettings.lineTransparent}
+              size={55}
+              gap={12}
+              shape={patternSettings.dotShape}
+              cornerRadius={patternSettings.cornerRadius}
+              glassEffect={patternSettings.glassEffect}
+            />
+          </div>
+        </PanelSectionRow>
+      ) : isTapCode ? (
+        <PanelSectionRow>
+          <div style={{ display: "flex", justifyContent: "center", marginTop: "12px" }}>
+            {/* fluid sizes KnockCodePad to 100% of ITS OWN parent, so that parent needs
+                an explicit width here rather than inheriting whatever the ambient QAM
+                panel happens to provide — the QAM's real rendered width isn't the same
+                on every tab (the Friends tab in particular gets a different container
+                than the rest, see BUILTIN_LOCKABLE_TABS/forceCollapsedWidth), which
+                otherwise rendered this grid at a visibly different size there than on
+                other tabs. Fixed at Pattern's own compact footprint (size 55, gap 12 →
+                55*3 + 12*2 = 189px) so both look identically sized, and identically on
+                every tab, the same fixed-width-wrapper technique PinLockScreen's own
+                full-screen KnockCodePad already uses (knockContainerWidth). */}
+            <div style={{ width: "189px" }}>
+              <KnockCodePad
+                onTap={onKnockTap}
+                showOutline={knockSettings.showOutline}
+                showDividers={knockSettings.showDividers}
+                fluid
+                gap={12}
+              />
+            </div>
+          </div>
+        </PanelSectionRow>
+      ) : (
+        <PanelSectionRow>
+          <div ref={(el) => { pinWrapperRef.current = el; }} style={{ position: "relative" }}>
+            <TextField
+              value={pin}
+              onChange={(e) => onPinChange(isPassword ? e.target.value : e.target.value.replace(/\D/g, ""))}
+              bIsPassword={true}
+              focusOnMount={true}
+            />
+            {pin.length > 0 && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: "12px",
+                  top: 0,
+                  bottom: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  pointerEvents: "none",
+                  mixBlendMode: "difference",
+                }}
+              >
+                {pin.split("").map((_, i) => (
+                  <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
+                ))}
+              </div>
+            )}
+          </div>
+        </PanelSectionRow>
+      )}
+    </>
+  );
+}
+
 function DeckyPanelPinPrompt({
   title,
   plainTitle,
@@ -844,9 +2172,17 @@ function DeckyPanelPinPrompt({
   onUnlocked: () => void;
 }) {
   const [pin, setPin] = useState("");
+  const [patternNodes, setPatternNodes] = useState<number[]>([]);
+  const [knockSequence, setKnockSequence] = useState<number[]>([]);
   const [error, setError] = useState("");
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+
+  // This component can stay mounted for a whole session (the QAM tab gate, plugin
+  // gate, and Main Menu item gate don't unmount it on close/reopen, just toggle
+  // visibility elsewhere), so without this, changing the Lock Method in settings never
+  // caused a re-render here and this kept showing the old method's entry UI below
+  // (lockMethod is read straight from cachedSettings each render, not tracked state).
+  useCachedSettingsVersion();
 
   useEffect(() => {
     const root = rootRef.current;
@@ -894,28 +2230,21 @@ function DeckyPanelPinPrompt({
     return () => observer.disconnect();
   }, [forceCollapsedWidth]);
 
-  // Hides the real typed digits (bIsPassword doesn't actually mask text in Steam's UI)
-  // so the dot overlay below is the only thing visibly showing PIN length. The dots use
-  // mix-blend-mode: difference instead of forcing a fixed background color — Steam's
-  // native focus style turns the input's background white, and a hardcoded dark
-  // background would both fight that and drift from whatever theme is active; a
-  // difference blend stays visible against light or dark automatically.
-  useEffect(() => {
-    const input = wrapperRef.current?.querySelector("input") as HTMLInputElement | null;
-    if (input) {
-      input.style.color = "transparent";
-      input.style.caretColor = "transparent";
-      (input.style as any).WebkitTextFillColor = "transparent";
-    }
-  }, [pin]);
+  const lockMethod = cachedSettings?.lock_method ?? "pin";
+  const isPattern = lockMethod === "pattern";
+  const isTapCode = lockMethod === "tap_code";
 
   const onSubmit = async () => {
-    const ok = await checkPin(pin);
+    if (isTapCode ? knockSequence.length === 0 : isPattern ? patternNodes.length === 0 : pin.length === 0) return;
+    const value = isPattern ? sequenceToString(patternNodes) : isTapCode ? sequenceToString(knockSequence) : pin;
+    const ok = await checkCredential(lockMethod, value);
     if (ok) {
       onUnlocked();
     } else {
-      setError("Incorrect PIN");
+      setError(`Incorrect ${credentialLabel(lockMethod)}`);
       setPin("");
+      setPatternNodes([]);
+      setKnockSequence([]);
     }
   };
 
@@ -960,50 +2289,53 @@ function DeckyPanelPinPrompt({
       <div style={{ paddingTop: title || onBack ? "16px" : 0, width: "100%", boxSizing: "border-box" }}>
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Enter PIN</div>
+            <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Enter {credentialLabel(lockMethod)}</div>
           </PanelSectionRow>
-          <PanelSectionRow>
-            <div ref={(el) => { wrapperRef.current = el; }} style={{ position: "relative" }}>
-              <TextField
-                value={pin}
-                onChange={(e) => {
-                  setError("");
-                  setPin(e.target.value.replace(/\D/g, ""));
-                }}
-                bIsPassword={true}
-                focusOnMount={true}
-              />
-              {pin.length > 0 && (
-                <div
-                  style={{
-                    position: "absolute",
-                    left: "12px",
-                    top: 0,
-                    bottom: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    pointerEvents: "none",
-                    mixBlendMode: "difference",
-                  }}
-                >
-                  {pin.split("").map((_, i) => (
-                    <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
-                  ))}
-                </div>
-              )}
-            </div>
-          </PanelSectionRow>
+          <CredentialCompactEntry
+            lockMethod={lockMethod}
+            pin={pin}
+            onPinChange={(value) => {
+              setError("");
+              setPin(value);
+            }}
+            pattern={patternNodes}
+            onPatternChange={(nodes) => {
+              setError("");
+              setPatternNodes(nodes);
+            }}
+            onPatternSubmit={onSubmit}
+            patternSettings={{
+              lineThemeColor: cachedSettings?.pattern_line_theme_color ?? false,
+              lineTransparent: cachedSettings?.pattern_line_transparent ?? false,
+              dotShape: cachedSettings?.pattern_dot_shape ?? "rounded",
+              cornerRadius: cachedSettings?.pattern_corner_radius ?? 14,
+              glassEffect: cachedSettings?.pattern_glass_effect ?? false,
+            }}
+            knock={knockSequence}
+            onKnockTap={(index) => {
+              setError("");
+              setKnockSequence((prev) => [...prev, index]);
+            }}
+            knockSettings={{
+              showOutline: cachedSettings?.tap_code_show_outline ?? true,
+              showDividers: cachedSettings?.tap_code_show_dividers ?? false,
+            }}
+          />
           {error && (
             <PanelSectionRow>
               <div style={{ color: "#f44336", fontSize: "13px" }}>{error}</div>
             </PanelSectionRow>
           )}
-          <PanelSectionRow>
-            <DialogButton onClick={onSubmit} style={{ width: "100%", marginTop: "12px" }}>
-              Unlock
-            </DialogButton>
-          </PanelSectionRow>
+          {/* Pattern submits on drag-release (see PatternPad's onDragComplete) — no
+              separate confirm step needed, unlike PIN/Password which still need this
+              button. */}
+          {!isPattern && (
+            <PanelSectionRow>
+              <DialogButton onClick={onSubmit} style={{ width: "100%", marginTop: "12px" }}>
+                Unlock
+              </DialogButton>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       </div>
     </div>
@@ -2054,7 +3386,7 @@ function patchQamDeckyTabLock(): { unregister: () => void } {
         // visible flash of the unlocked plugin list before the gate caught up.
         if (deckyTabActive && !wasDeckyTabActive) {
           const s = cachedSettings;
-          if (s?.decky_panel_lock_enabled && s?.pin_set && deckyQamLocked) {
+          if (s?.decky_panel_lock_enabled && hasCredentialSet(s) && deckyQamLocked) {
             deckyPanelGateVisible = true;
             notifyDeckyQamLockChange();
           }
@@ -3059,13 +4391,16 @@ function CollapsibleSection({
 // Quick-Access Menu panel content. Shows a PIN entry gate first when QAM lock is
 // enabled and a PIN has been set, then the main settings panel.
 function Content() {
-  const [settings, setSettings] = useState<DeckLockerSettings>({
+  const [settings, setSettings] = useState<DeckLockerSettings>(() => ({
     global_lock_enabled: false,
     locked_apps: [],
     locked_plugins: [],
     locked_qam_tabs: [],
     locked_main_menu_items: [],
     pin_set: false,
+    password_set: false,
+    pattern_set: false,
+    tap_code_set: false,
     qam_lock_enabled: false,
     keypad_corner_radius: 14,
     lockscreen_hero_bg_enabled: false,
@@ -3084,7 +4419,16 @@ function Content() {
     locked_badge_enabled: true,
     locked_badge_position: "top-left",
     lock_method: "pin",
-  });
+    pattern_dot_shape: "rounded",
+    pattern_corner_radius: 14,
+    pattern_dot_size: 72,
+    pattern_glass_effect: false,
+    pattern_line_theme_color: false,
+    pattern_line_transparent: false,
+    action_button_glass_effect: false,
+    tap_code_show_outline: true,
+    tap_code_show_dividers: false,
+  }));
   const [apps, setApps] = useState<AppInfo[]>([]);
   const [otherPlugins, setOtherPlugins] = useState<{ name: string; icon?: ReactNode }[]>([]);
   const [showGamesList, setShowGamesList] = useState(false);
@@ -3100,23 +4444,9 @@ function Content() {
   // resets qamUnlockedThisSession.
   const [qamUnlocked, setQamUnlocked] = useState(() => qamUnlockedThisSession);
   const [qamPinInput, setQamPinInput] = useState("");
+  const [qamPatternNodes, setQamPatternNodes] = useState<number[]>([]);
+  const [qamKnockSequence, setQamKnockSequence] = useState<number[]>([]);
   const [qamPinError, setQamPinError] = useState("");
-  const qamPinInputWrapperRef = useRef<HTMLDivElement | null>(null);
-
-  // Hides the real typed digits (bIsPassword doesn't actually mask text in Steam's UI)
-  // so the dot overlay below is the only thing visibly showing PIN length. The dots use
-  // mix-blend-mode: difference instead of forcing a fixed background color — Steam's
-  // native focus style turns the input's background white, and a hardcoded dark
-  // background would both fight that and drift from whatever theme is active; a
-  // difference blend stays visible against light or dark automatically.
-  useEffect(() => {
-    const input = qamPinInputWrapperRef.current?.querySelector("input") as HTMLInputElement | null;
-    if (input) {
-      input.style.color = "transparent";
-      input.style.caretColor = "transparent";
-      (input.style as any).WebkitTextFillColor = "transparent";
-    }
-  }, [qamPinInput]);
 
   useEffect(() => {
     getSettings().then(setSettings);
@@ -3139,43 +4469,43 @@ function Content() {
   const onGlobalToggle = async (checked: boolean) => {
     const updated = await setGlobalLock(checked);
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
   };
 
   const onQamLockToggle = async (checked: boolean) => {
     const updated = await setQamLock(checked);
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
   };
 
   const onDeckyPanelLockToggle = async (checked: boolean) => {
     const updated = await setCustomization({ decky_panel_lock_enabled: checked });
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
   };
 
   const onRelockOnSleepToggle = async (checked: boolean) => {
     const updated = await setCustomization({ relock_on_sleep: checked });
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
   };
 
   const onRelockOnExitToggle = async (checked: boolean) => {
     const updated = await setCustomization({ relock_on_exit: checked });
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
   };
 
   const onAppToggle = async (appid: string, checked: boolean) => {
     const lockedApps = await toggleApp(appid, checked);
     setSettings((prev) => ({ ...prev, locked_apps: lockedApps }));
-    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_apps: lockedApps };
+    if (cachedSettings) setCachedSettings({ ...cachedSettings, locked_apps: lockedApps });
   };
 
   const onPluginToggle = async (pluginName: string, checked: boolean) => {
     const lockedPlugins = await togglePluginLock(pluginName, checked);
     setSettings((prev) => ({ ...prev, locked_plugins: lockedPlugins }));
-    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_plugins: lockedPlugins };
+    if (cachedSettings) setCachedSettings({ ...cachedSettings, locked_plugins: lockedPlugins });
     // Apply immediately rather than waiting for the next time the Decky tab becomes
     // active — the user is already looking at this plugin's own panel right now.
     applyPluginLocks();
@@ -3184,7 +4514,7 @@ function Content() {
   const onQamTabToggle = async (tabName: string, checked: boolean) => {
     const lockedTabs = await toggleQamTabLock(tabName, checked);
     setSettings((prev) => ({ ...prev, locked_qam_tabs: lockedTabs }));
-    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_qam_tabs: lockedTabs };
+    if (cachedSettings) setCachedSettings({ ...cachedSettings, locked_qam_tabs: lockedTabs });
     // No immediate apply needed here — the toggled tab isn't the one currently
     // visible (the user is looking at this settings panel, on Decky's own tab), and
     // the wrap/unwrap runs on every QAM render regardless, which happens often enough
@@ -3194,78 +4524,103 @@ function Content() {
   const onMainMenuItemToggle = async (itemName: string, checked: boolean) => {
     const lockedItems = await toggleMainMenuItemLock(itemName, checked);
     setSettings((prev) => ({ ...prev, locked_main_menu_items: lockedItems }));
-    if (cachedSettings) cachedSettings = { ...cachedSettings, locked_main_menu_items: lockedItems };
+    if (cachedSettings) setCachedSettings({ ...cachedSettings, locked_main_menu_items: lockedItems });
   };
 
   const onCustomizationChange = async (updates: Partial<DeckLockerSettings>) => {
     const updated = await setCustomization(updates);
     setSettings(updated);
-    cachedSettings = updated;
+    setCachedSettings(updated);
+  };
+
+  // In-plugin equivalent of running scripts/reset-decklocker.sh — wipes the lock
+  // credential and every lock/customization choice back to defaults (the backend backs
+  // up the old settings file first, same as the script). Confirmed via a destructive
+  // ConfirmModal first since there's no undo from inside the plugin.
+  const onFactoryReset = async () => {
+    const updated = await resetAllSettings();
+    setSettings(updated);
+    setCachedSettings(updated);
   };
 
   const onQamPinSubmit = async () => {
-    const ok = await checkPin(qamPinInput);
+    const isEmpty =
+      settings.lock_method === "pattern"
+        ? qamPatternNodes.length === 0
+        : settings.lock_method === "tap_code"
+        ? qamKnockSequence.length === 0
+        : qamPinInput.length === 0;
+    if (isEmpty) return;
+    const value =
+      settings.lock_method === "pattern"
+        ? sequenceToString(qamPatternNodes)
+        : settings.lock_method === "tap_code"
+        ? sequenceToString(qamKnockSequence)
+        : qamPinInput;
+    const ok = await checkCredential(settings.lock_method, value);
     if (ok) {
       qamUnlockedThisSession = true;
       setQamUnlocked(true);
       setQamPinError("");
     } else {
-      setQamPinError("Incorrect PIN");
+      setQamPinError(`Incorrect ${credentialLabel(settings.lock_method)}`);
       setQamPinInput("");
+      setQamPatternNodes([]);
+      setQamKnockSequence([]);
     }
   };
 
-  if (settings.qam_lock_enabled && settings.pin_set && !qamUnlocked) {
+  if (settings.qam_lock_enabled && hasCredentialSet(settings) && !qamUnlocked) {
     return (
       <PanelSection>
         <PanelSectionRow>
-          <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Enter PIN</div>
+          <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Enter {credentialLabel(settings.lock_method)}</div>
         </PanelSectionRow>
-        <PanelSectionRow>
-          <div
-            ref={(el) => { qamPinInputWrapperRef.current = el; }}
-            style={{ position: "relative" }}
-          >
-            <TextField
-              value={qamPinInput}
-              onChange={(e) => {
-                setQamPinError("");
-                setQamPinInput(e.target.value.replace(/\D/g, ""));
-              }}
-              bIsPassword={true}
-              focusOnMount={true}
-            />
-            {qamPinInput.length > 0 && (
-              <div
-                style={{
-                  position: "absolute",
-                  left: "12px",
-                  top: 0,
-                  bottom: 0,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  pointerEvents: "none",
-                  mixBlendMode: "difference",
-                }}
-              >
-                {qamPinInput.split("").map((_, i) => (
-                  <div key={i} style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#fff" }} />
-                ))}
-              </div>
-            )}
-          </div>
-        </PanelSectionRow>
+        <CredentialCompactEntry
+          lockMethod={settings.lock_method}
+          pin={qamPinInput}
+          onPinChange={(value) => {
+            setQamPinError("");
+            setQamPinInput(value);
+          }}
+          pattern={qamPatternNodes}
+          onPatternChange={(nodes) => {
+            setQamPinError("");
+            setQamPatternNodes(nodes);
+          }}
+          onPatternSubmit={onQamPinSubmit}
+          patternSettings={{
+            lineThemeColor: settings.pattern_line_theme_color,
+            lineTransparent: settings.pattern_line_transparent,
+            dotShape: settings.pattern_dot_shape,
+            cornerRadius: settings.pattern_corner_radius,
+            glassEffect: settings.pattern_glass_effect,
+          }}
+          knock={qamKnockSequence}
+          onKnockTap={(index) => {
+            setQamPinError("");
+            setQamKnockSequence((prev) => [...prev, index]);
+          }}
+          knockSettings={{
+            showOutline: settings.tap_code_show_outline,
+            showDividers: settings.tap_code_show_dividers,
+          }}
+        />
         {qamPinError && (
           <PanelSectionRow>
             <div style={{ color: "#f44336", fontSize: "13px" }}>{qamPinError}</div>
           </PanelSectionRow>
         )}
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={onQamPinSubmit}>
-            Unlock
-          </ButtonItem>
-        </PanelSectionRow>
+        {/* Pattern submits on drag-release (see PatternPad's onDragComplete) — no
+            separate confirm step needed, unlike PIN/Password which still need this
+            button. */}
+        {settings.lock_method !== "pattern" && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={onQamPinSubmit}>
+              Unlock
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
       </PanelSection>
     );
   }
@@ -3285,80 +4640,211 @@ function Content() {
           </div>
         </PanelSectionRow>
 
-        <PanelSectionRow>
-          <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>KEYPAD</div>
-        </PanelSectionRow>
+        {/* PIN-only — the numeric keypad grid. Password's text field, Pattern's dot
+            grid, and Knock Code's 2x2 grid each get their own (much smaller) section
+            instead of sharing this one. */}
+        {settings.lock_method === "pin" && (
+          <>
+            <PanelSectionRow>
+              <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>KEYPAD</div>
+            </PanelSectionRow>
 
-        <PanelSectionRow>
-          <DropdownItem
-            label="Key Shape"
-            description="Choose the shape of the keypad buttons"
-            rgOptions={[
-              { data: "square", label: "Square" },
-              { data: "rounded", label: "Rounded" },
-              { data: "circle", label: "Circle" },
-            ]}
-            selectedOption={settings.keypad_shape}
-            onChange={(option) => onCustomizationChange({ keypad_shape: option.data })}
-          />
-        </PanelSectionRow>
+            <PanelSectionRow>
+              <DropdownItem
+                label="Key Shape"
+                description="Choose the shape of the keypad buttons"
+                rgOptions={[
+                  { data: "square", label: "Square" },
+                  { data: "rounded", label: "Rounded" },
+                  { data: "circle", label: "Circle" },
+                ]}
+                selectedOption={settings.keypad_shape}
+                onChange={(option) => onCustomizationChange({ keypad_shape: option.data })}
+              />
+            </PanelSectionRow>
 
-        {settings.keypad_shape === "rounded" && (
-          <PanelSectionRow>
-            <SliderField
-              label="Corner Roundness"
-              description="How rounded the key corners are"
-              value={settings.keypad_corner_radius}
-              min={0}
-              max={36}
-              step={1}
-              onChange={(value: number) => onCustomizationChange({ keypad_corner_radius: value })}
-            />
-          </PanelSectionRow>
+            {settings.keypad_shape === "rounded" && (
+              <PanelSectionRow>
+                <SliderField
+                  label="Corner Roundness"
+                  description="How rounded the key corners are"
+                  value={settings.keypad_corner_radius}
+                  min={0}
+                  max={36}
+                  step={1}
+                  onChange={(value: number) => onCustomizationChange({ keypad_corner_radius: value })}
+                />
+              </PanelSectionRow>
+            )}
+
+            <PanelSectionRow>
+              <SliderField
+                label="Key Size"
+                description="Size of each keypad button"
+                value={settings.keypad_key_size}
+                min={60}
+                max={110}
+                step={2}
+                onChange={(value: number) => onCustomizationChange({ keypad_key_size: value })}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <SliderField
+                label="Number Size"
+                description="Size of the numbers on each key"
+                value={settings.keypad_font_size}
+                min={14}
+                max={32}
+                step={1}
+                onChange={(value: number) => onCustomizationChange({ keypad_font_size: value })}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Glass Effect"
+                description="Frosted-glass look for the keypad buttons"
+                checked={settings.keypad_glass_effect}
+                onChange={(checked) => onCustomizationChange({ keypad_glass_effect: checked })}
+              />
+            </PanelSectionRow>
+          </>
         )}
 
-        <PanelSectionRow>
-          <SliderField
-            label="Key Size"
-            description="Size of each keypad button"
-            value={settings.keypad_key_size}
-            min={60}
-            max={110}
-            step={2}
-            onChange={(value: number) => onCustomizationChange({ keypad_key_size: value })}
-          />
-        </PanelSectionRow>
+        {/* Pattern's own dot grid — replicated from KEYPAD above (same shape/size/glass
+            vocabulary) with its own independent settings, plus "None" (a bare dot with
+            no cell behind it, so Dot Size/Glass Effect have nothing left to affect and
+            are hidden) and the theme line-color option. */}
+        {settings.lock_method === "pattern" && (
+          <>
+            <PanelSectionRow>
+              <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>PATTERN</div>
+            </PanelSectionRow>
 
-        <PanelSectionRow>
-          <SliderField
-            label="Number Size"
-            description="Size of the numbers on each key"
-            value={settings.keypad_font_size}
-            min={14}
-            max={32}
-            step={1}
-            onChange={(value: number) => onCustomizationChange({ keypad_font_size: value })}
-          />
-        </PanelSectionRow>
+            <PanelSectionRow>
+              <DropdownItem
+                label="Dot Shape"
+                description="Choose the shape behind each dot, or None for bare dots"
+                rgOptions={[
+                  { data: "square", label: "Square" },
+                  { data: "rounded", label: "Rounded" },
+                  { data: "circle", label: "Circle" },
+                  { data: "none", label: "None" },
+                ]}
+                selectedOption={settings.pattern_dot_shape}
+                onChange={(option) => onCustomizationChange({ pattern_dot_shape: option.data })}
+              />
+            </PanelSectionRow>
 
-        <PanelSectionRow>
-          <ToggleField
-            label="Glass Effect"
-            description="Frosted-glass look for the keypad buttons"
-            checked={settings.keypad_glass_effect}
-            onChange={(checked) => onCustomizationChange({ keypad_glass_effect: checked })}
-          />
-        </PanelSectionRow>
+            {settings.pattern_dot_shape === "rounded" && (
+              <PanelSectionRow>
+                <SliderField
+                  label="Corner Roundness"
+                  description="How rounded the dot cell's corners are"
+                  value={settings.pattern_corner_radius}
+                  min={0}
+                  max={36}
+                  step={1}
+                  onChange={(value: number) => onCustomizationChange({ pattern_corner_radius: value })}
+                />
+              </PanelSectionRow>
+            )}
 
-        {!settings.hide_game_art && (
-          <PanelSectionRow>
-            <ToggleField
-              label="Swap Keypad Side"
-              description="Move the keypad to the right, game art to the left"
-              checked={settings.keypad_on_right}
-              onChange={(checked) => onCustomizationChange({ keypad_on_right: checked })}
-            />
-          </PanelSectionRow>
+            {settings.pattern_dot_shape !== "none" && (
+              <PanelSectionRow>
+                <SliderField
+                  label="Dot Size"
+                  description="Size of each dot's cell"
+                  value={settings.pattern_dot_size}
+                  min={60}
+                  max={110}
+                  step={2}
+                  onChange={(value: number) => onCustomizationChange({ pattern_dot_size: value })}
+                />
+              </PanelSectionRow>
+            )}
+
+            {settings.pattern_dot_shape !== "none" && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="Glass Effect"
+                  description="Frosted-glass look for each dot's cell"
+                  checked={settings.pattern_glass_effect}
+                  onChange={(checked) => onCustomizationChange({ pattern_glass_effect: checked })}
+                />
+              </PanelSectionRow>
+            )}
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Theme Color"
+                description="Color the dots/lines using the current theme's slider color instead of white"
+                checked={settings.pattern_line_theme_color}
+                onChange={(checked) => onCustomizationChange({ pattern_line_theme_color: checked })}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Transparent Line"
+                description="Hide the line connecting the dots — only the dots themselves show"
+                checked={settings.pattern_line_transparent}
+                onChange={(checked) => onCustomizationChange({ pattern_line_transparent: checked })}
+              />
+            </PanelSectionRow>
+          </>
+        )}
+
+        {/* Knock Code's customization is deliberately minimal — there's no per-cell
+            background, shape, or size left to style (see KnockCodePad), so the only
+            things left to offer are the single outline around the whole grid and,
+            optionally, divider lines splitting it into 4 visible quadrants. */}
+        {settings.lock_method === "tap_code" && (
+          <>
+            <PanelSectionRow>
+              <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>KNOCK CODE</div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Outline"
+                description="Show an outline around the whole Knock Code grid"
+                checked={settings.tap_code_show_outline}
+                onChange={(checked) => onCustomizationChange({ tap_code_show_outline: checked })}
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Dividers"
+                description="Show divider lines splitting the grid into 4 quadrants"
+                checked={settings.tap_code_show_dividers}
+                onChange={(checked) => onCustomizationChange({ tap_code_show_dividers: checked })}
+              />
+            </PanelSectionRow>
+          </>
+        )}
+
+        {/* Password's text field and Pattern's dot grid share the same dedicated
+            Cancel/OK row (PIN's own Cancel/OK are keypad cells, covered by the
+            KEYPAD section's own Glass Effect above instead; Knock Code's own Cancel/OK
+            row intentionally isn't customizable, keeping its section above minimal). */}
+        {(settings.lock_method === "password" || settings.lock_method === "pattern") && (
+          <>
+            <PanelSectionRow>
+              <div style={{ fontWeight: "bold", marginTop: "12px", opacity: 0.7, fontSize: "12px" }}>BUTTONS</div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <ToggleField
+                label="Cancel/OK Glass Effect"
+                description="Frosted-glass look for the Cancel and OK buttons"
+                checked={settings.action_button_glass_effect}
+                onChange={(checked) => onCustomizationChange({ action_button_glass_effect: checked })}
+              />
+            </PanelSectionRow>
+          </>
         )}
 
         <PanelSectionRow>
@@ -3367,12 +4853,23 @@ function Content() {
 
         <PanelSectionRow>
           <ToggleField
-            label="Keypad Only"
-            description="Hide the game cover art and show just the centered keypad"
-            checked={settings.hide_game_art}
-            onChange={(checked) => onCustomizationChange({ hide_game_art: checked })}
+            label="Game Art"
+            description="Show the game cover art next to the lock screen"
+            checked={!settings.hide_game_art}
+            onChange={(checked) => onCustomizationChange({ hide_game_art: !checked })}
           />
         </PanelSectionRow>
+
+        {!settings.hide_game_art && (
+          <PanelSectionRow>
+            <ToggleField
+              label="Swap Side"
+              description="Move the credential entry to the right, game art to the left"
+              checked={settings.keypad_on_right}
+              onChange={(checked) => onCustomizationChange({ keypad_on_right: checked })}
+            />
+          </PanelSectionRow>
+        )}
 
         <PanelSectionRow>
           <ToggleField
@@ -3463,6 +4960,15 @@ function Content() {
                   keypad_font_size: 22,
                   keypad_glass_effect: false,
                   keypad_on_right: false,
+                  pattern_dot_shape: "rounded",
+                  pattern_corner_radius: 14,
+                  pattern_dot_size: 72,
+                  pattern_glass_effect: false,
+                  pattern_line_theme_color: false,
+                  pattern_line_transparent: false,
+                  action_button_glass_effect: false,
+                  tap_code_show_outline: true,
+                  tap_code_show_dividers: false,
                   hide_game_art: false,
                   lockscreen_hero_bg_enabled: false,
                   lockscreen_bg_blur_px: 8,
@@ -3506,7 +5012,7 @@ function Content() {
             {LOCK_METHOD_OPTIONS.map((method) => (
               <PanelSectionRow key={method.data}>
                 <Field
-                  label={method.label}
+                  label={method.implemented ? method.label : `${method.label} (Soon)`}
                   disabled={!method.implemented}
                   focusable={method.implemented}
                   onActivate={() => onCustomizationChange({ lock_method: method.data })}
@@ -3520,10 +5026,23 @@ function Content() {
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              onClick={() => showModal(<SetPinModal onPinSet={() => getSettings().then(setSettings)} />)}
+              onClick={() => {
+                const refresh = () => getSettings().then((s) => { setSettings(s); setCachedSettings(s); });
+                showModal(
+                  settings.lock_method === "password" ? (
+                    <SetPasswordModal onPasswordSet={refresh} />
+                  ) : settings.lock_method === "pattern" ? (
+                    <SetPatternModal onPatternSet={refresh} />
+                  ) : settings.lock_method === "tap_code" ? (
+                    <SetKnockCodeModal onTapCodeSet={refresh} />
+                  ) : (
+                    <SetPinModal onPinSet={refresh} />
+                  )
+                );
+              }}
             >
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span>Set PIN</span>
+                <span>Set {credentialLabel(settings.lock_method)}</span>
                 <FaTh size={14} />
               </div>
             </ButtonItem>
@@ -3575,7 +5094,7 @@ function Content() {
             <div style={{ height: "1px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "4px" }} />
           </PanelSectionRow>
 
-          {settings.pin_set && (
+          {hasCredentialSet(settings) && (
             <>
               <PanelSectionRow>
                 <div style={{ fontWeight: "bold", marginTop: "16px" }}>GAMES</div>
@@ -3701,20 +5220,66 @@ function Content() {
 
               <PanelSectionRow>
                 <div style={{ height: "3px", background: "rgba(255,255,255,0.15)", marginTop: "16px", marginBottom: "12px", borderRadius: "2px" }} />
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              </PanelSectionRow>
+
+              <PanelSectionRow>
+                {/* Plain DialogButton rather than ButtonItem — ButtonItem draws its own
+                    native bottom separator line, which read as a stray divider sitting
+                    above the GitHub row right below it. DialogButton (same as the
+                    GitHub/QR buttons underneath) doesn't carry that. */}
+                <DialogButton
+                  onClick={() =>
+                    showModal(
+                      <ConfirmModal
+                        strTitle="Reset Deck Locker?"
+                        strDescription="This erases your lock credential and every lock/customization setting back to defaults — the same wipe scripts/reset-decklocker.sh does. A backup of the current settings is kept alongside it. This can't be undone from here."
+                        bDestructiveWarning
+                        strOKButtonText="Reset"
+                        onOK={onFactoryReset}
+                      />
+                    )
+                  }
+                  style={{ width: "100%" }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span>Reset Deck Locker</span>
+                    <FaTrash size={14} />
+                  </div>
+                </DialogButton>
+              </PanelSectionRow>
+
+              <PanelSectionRow>
+                {/* Grid (not flex) so Steam's spatial nav moves between the two buttons
+                    with left/right instead of treating the row as a single stop — same
+                    fix as Cancel/OK on the lock screen itself. The GitHub glyph stays a
+                    plain (non-focusable) decoration outside the grid. */}
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "12px" }}>
                   <FaGithub size={28} color="#fff" style={{ flexShrink: 0, opacity: 0.85 }} />
-                  <DialogButton
-                    onClick={() => Navigation.NavigateToExternalWeb(DECKLOCKER_GITHUB_URL)}
-                    style={{ flex: 1 }}
+                  <Focusable
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr 40px",
+                      gap: "8px",
+                      flex: 1,
+                    }}
                   >
-                    Open Project
-                  </DialogButton>
-                  <DialogButton
-                    onClick={() => showModal(<ProjectQrModal />)}
-                    style={{ width: "40px", minWidth: "40px", padding: "10px", flexShrink: 0 }}
-                  >
-                    <FaQrcode size={16} />
-                  </DialogButton>
+                    <Focusable style={{ minWidth: 0 }}>
+                      <DialogButton
+                        onClick={() => Navigation.NavigateToExternalWeb(DECKLOCKER_GITHUB_URL)}
+                        style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+                      >
+                        Open Project
+                      </DialogButton>
+                    </Focusable>
+                    <Focusable style={{ minWidth: 0 }}>
+                      <DialogButton
+                        onClick={() => showModal(<ProjectQrModal />)}
+                        style={{ width: "100%", minWidth: "40px", padding: "10px", boxSizing: "border-box" }}
+                      >
+                        <FaQrcode size={16} />
+                      </DialogButton>
+                    </Focusable>
+                  </Focusable>
                 </div>
               </PanelSectionRow>
             </>

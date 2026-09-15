@@ -1,9 +1,11 @@
 import os
 import json
 import glob
+import shutil
 import base64
 import hashlib
 import mimetypes
+from datetime import datetime
 import decky
 
 SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
@@ -55,6 +57,18 @@ class Plugin:
             self.settings.setdefault("locked_badge_enabled", True)
             self.settings.setdefault("locked_badge_position", "top-left")
             self.settings.setdefault("lock_method", "pin")
+            self.settings.setdefault("password_hash", "")
+            self.settings.setdefault("pattern_hash", "")
+            self.settings.setdefault("pattern_dot_shape", "rounded")
+            self.settings.setdefault("pattern_corner_radius", 14)
+            self.settings.setdefault("pattern_dot_size", 72)
+            self.settings.setdefault("pattern_glass_effect", False)
+            self.settings.setdefault("pattern_line_theme_color", False)
+            self.settings.setdefault("pattern_line_transparent", False)
+            self.settings.setdefault("action_button_glass_effect", False)
+            self.settings.setdefault("tap_code_hash", "")
+            self.settings.setdefault("tap_code_show_outline", True)
+            self.settings.setdefault("tap_code_show_dividers", False)
         else:
             self.settings = self._default_settings()
 
@@ -63,6 +77,9 @@ class Plugin:
         return {
             "global_lock_enabled": False,
             "pin_hash": "",
+            "password_hash": "",
+            "pattern_hash": "",
+            "tap_code_hash": "",
             "locked_apps": [],
             "locked_plugins": [],
             "locked_qam_tabs": [],
@@ -85,6 +102,15 @@ class Plugin:
             "locked_badge_enabled": True,
             "locked_badge_position": "top-left",
             "lock_method": "pin",
+            "pattern_dot_shape": "rounded",
+            "pattern_corner_radius": 14,
+            "pattern_dot_size": 72,
+            "pattern_glass_effect": False,
+            "pattern_line_theme_color": False,
+            "pattern_line_transparent": False,
+            "action_button_glass_effect": False,
+            "tap_code_show_outline": True,
+            "tap_code_show_dividers": False,
         }
 
     async def _save_settings(self):
@@ -93,10 +119,16 @@ class Plugin:
             json.dump(self.settings, f)
 
     def _public_settings(self) -> dict:
-        # Strips pin_hash from all responses to the frontend — the hash should never
-        # leave the backend. Replaces it with a boolean indicating whether a PIN is set.
-        result = {k: v for k, v in self.settings.items() if k != "pin_hash"}
+        # Strips every credential hash from responses to the frontend — hashes should
+        # never leave the backend. Replaces each with a boolean indicating whether that
+        # method's credential is set.
+        result = {
+            k: v for k, v in self.settings.items() if k not in ("pin_hash", "password_hash", "pattern_hash", "tap_code_hash")
+        }
         result["pin_set"] = bool(self.settings.get("pin_hash", ""))
+        result["password_set"] = bool(self.settings.get("password_hash", ""))
+        result["pattern_set"] = bool(self.settings.get("pattern_hash", ""))
+        result["tap_code_set"] = bool(self.settings.get("tap_code_hash", ""))
         return result
 
     async def get_settings(self):
@@ -117,20 +149,64 @@ class Plugin:
         await self._save_settings()
         return self._public_settings()
 
-    # "lock_method" picks which credential type protects locked content ("pin" is the
-    # only one implemented so far; "password", "pattern", and "tap_code" are reserved
-    # for future methods and already round-trip through settings). Adding a new one
-    # needs: its own set_/check_ pair here (mirroring set_pin/check_pin) storing under
-    # its own settings key (never reuse "pin_hash"), and a matching credential-entry
-    # component on the frontend that reads/writes it based on settings.lock_method.
-    async def set_pin(self, pin: str):
-        self.settings["pin_hash"] = hashlib.sha256(pin.encode()).hexdigest()
+    async def reset_all_settings(self):
+        # In-plugin equivalent of scripts/reset-decklocker.sh: same backup-then-wipe
+        # behavior (erases the lock credential and every lock/customization choice),
+        # but applied to the already-running backend's in-memory settings and saved
+        # immediately instead of just deleting the file — so it takes effect without
+        # needing a plugin_loader restart or a Desktop Mode terminal.
+        if os.path.exists(SETTINGS_FILE):
+            backup = f"{SETTINGS_FILE}.bak.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            shutil.copy(SETTINGS_FILE, backup)
+        self.settings = self._default_settings()
+        await self._save_settings()
+        return self._public_settings()
+
+    # "lock_method" picks which credential type protects locked content ("pin",
+    # "password", "pattern", and "tap_code" are implemented; "controller_code" is
+    # reserved for a future method and already round-trips through settings). All four
+    # share the same hash-and-compare logic via _set_credential/_check_credential below;
+    # adding a new method just needs a settings key plus a one-line set_/check_ pair
+    # here (kept separate so each stays independently callable from the frontend), and
+    # a matching credential-entry component that reads/writes it based on
+    # settings.lock_method.
+    #
+    # The pattern and tap_code (Knock Code) credentials arrive pre-serialized by the
+    # frontend as their node/cell order joined with "-" (e.g. "0-4-8-6-2" for a pattern,
+    # "0-0-3-1" for a tap code); the backend just hashes whatever string it's given,
+    # same as PIN/password.
+    async def _set_credential(self, settings_key: str, value: str):
+        self.settings[settings_key] = hashlib.sha256(value.encode()).hexdigest()
         await self._save_settings()
         return True
 
+    def _check_credential(self, settings_key: str, value: str) -> bool:
+        guess_hash = hashlib.sha256(value.encode()).hexdigest()
+        return guess_hash == self.settings.get(settings_key, "")
+
+    async def set_pin(self, pin: str):
+        return await self._set_credential("pin_hash", pin)
+
     async def check_pin(self, pin: str) -> bool:
-        guess_hash = hashlib.sha256(pin.encode()).hexdigest()
-        return guess_hash == self.settings.get("pin_hash", "")
+        return self._check_credential("pin_hash", pin)
+
+    async def set_password(self, password: str):
+        return await self._set_credential("password_hash", password)
+
+    async def check_password(self, password: str) -> bool:
+        return self._check_credential("password_hash", password)
+
+    async def set_pattern(self, pattern: str):
+        return await self._set_credential("pattern_hash", pattern)
+
+    async def check_pattern(self, pattern: str) -> bool:
+        return self._check_credential("pattern_hash", pattern)
+
+    async def set_tap_code(self, code: str):
+        return await self._set_credential("tap_code_hash", code)
+
+    async def check_tap_code(self, code: str) -> bool:
+        return self._check_credential("tap_code_hash", code)
 
     async def toggle_app(self, app_id: str, locked: bool):
         locked_apps = set(self.settings.get("locked_apps", []))

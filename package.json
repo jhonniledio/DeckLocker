@@ -1,7 +1,7 @@
 {
   "name": "DeckLocker",
-  "version": "0.1.0",
-  "description": "Lock games, plugins, Quick Access Menu tabs, and Steam Menu items behind a PIN, with optional lock badges and deep lock-screen customization.",
+  "version": "0.2.0-beta.1",
+  "description": "Lock games, plugins, Quick Access Menu tabs, and Steam Menu items behind a PIN, password, pattern, or Knock Code, with optional lock badges and deep lock-screen customization.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
